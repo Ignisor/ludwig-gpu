@@ -15,7 +15,7 @@ with open(path.join(here, 'README.md'), encoding='utf-8') as f:
 setup(
     name='ludwig',
 
-    version='0.1.1',
+    version='0.2.1',
 
     description='A deep learning experimentation toolbox',
     long_description=long_description,
@@ -49,8 +49,13 @@ setup(
                       'spacy>=2.1',
                       'tqdm',
                       'tabulate>=0.7',
-                      'tensorflow-gpu==1.13.1',
-                      'PyYAML>=3.12'
+                      'tensorflow==1.14.0',
+                      'PyYAML>=3.12',
+                      'fastapi',
+                      'pydantic',
+                      'uvicorn',
+                      'python-multipart',
+                      'soundfile',
                       ],
 
     entry_points={

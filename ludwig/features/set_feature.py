@@ -31,6 +31,8 @@ from ludwig.models.modules.initializer_modules import get_initializer
 from ludwig.utils.misc import set_default_value
 from ludwig.utils.strings_utils import create_vocabulary
 
+logger = logging.getLogger(__name__)
+
 
 class SetBaseFeature(BaseFeature):
     def __init__(self, feature):
@@ -38,7 +40,7 @@ class SetBaseFeature(BaseFeature):
         self.type = IMAGE
 
     preprocessing_defaults = {
-        'format': 'space',
+        'tokenizer': 'space',
         'most_common': 10000,
         'lowercase': False,
         'missing_value_strategy': FILL_WITH_CONST,
@@ -49,7 +51,7 @@ class SetBaseFeature(BaseFeature):
     def get_feature_meta(column, preprocessing_parameters):
         idx2str, str2idx, str2freq, max_size = create_vocabulary(
             column,
-            preprocessing_parameters['format'],
+            preprocessing_parameters['tokenizer'],
             num_most_frequent=preprocessing_parameters['most_common'],
             lowercase=preprocessing_parameters['lowercase']
         )
@@ -68,7 +70,7 @@ class SetBaseFeature(BaseFeature):
                 lambda x: set_str_to_idx(
                     x,
                     metadata['str2idx'],
-                    preprocessing_parameters['format']
+                    preprocessing_parameters['tokenizer']
                 )
             )
         )
@@ -143,7 +145,7 @@ class SetInputFeature(SetBaseFeature, InputFeature):
             **kwargs
     ):
         placeholder = self._get_input_placeholder()
-        logging.debug('  placeholder: {0}'.format(placeholder))
+        logger.debug('  placeholder: {0}'.format(placeholder))
 
         embedded, embedding_size = self.embed_sparse(
             placeholder,
@@ -151,7 +153,7 @@ class SetInputFeature(SetBaseFeature, InputFeature):
             dropout_rate,
             is_training=is_training
         )
-        logging.debug('  feature_representation: {0}'.format(embedded))
+        logger.debug('  feature_representation: {0}'.format(embedded))
 
         feature_representation = {
             'name': self.name,
@@ -213,16 +215,16 @@ class SetOutputFeature(SetBaseFeature, OutputFeature):
                 initializer=initializer_obj([hidden_size, self.num_classes]),
                 regularizer=regularizer
             )
-            logging.debug('  class_weights: {0}'.format(weights))
+            logger.debug('  class_weights: {0}'.format(weights))
 
             biases = tf.get_variable(
                 'biases',
                 [self.num_classes]
             )
-            logging.debug('  class_biases: {0}'.format(biases))
+            logger.debug('  class_biases: {0}'.format(biases))
 
             logits = tf.matmul(hidden, weights) + biases
-            logging.debug('  logits: {0}'.format(logits))
+            logger.debug('  logits: {0}'.format(logits))
 
             probabilities = tf.nn.sigmoid(
                 logits,
@@ -274,6 +276,8 @@ class SetOutputFeature(SetBaseFeature, OutputFeature):
             hidden,
             hidden_size,
             regularizer=None,
+            dropout_rate=None,
+            is_training=None,
             **kwargs
     ):
         output_tensors = {}
@@ -281,7 +285,7 @@ class SetOutputFeature(SetBaseFeature, OutputFeature):
         # ================ Placeholder ================
         targets = self._get_output_placeholder()
         output_tensors[self.name] = targets
-        logging.debug('  targets_placeholder: {0}'.format(targets))
+        logger.debug('  targets_placeholder: {0}'.format(targets))
 
         # ================ Predictions ================
         ppl = self._get_predictions(
@@ -364,7 +368,7 @@ class SetOutputFeature(SetBaseFeature, OutputFeature):
             result,
             metadata,
             experiment_dir_name,
-            skip_save_unprocessed_output=False
+            skip_save_unprocessed_output=False,
     ):
         postprocessed = {}
         npy_filename = os.path.join(experiment_dir_name, '{}_{}.npy')

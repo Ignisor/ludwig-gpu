@@ -34,6 +34,7 @@ from ludwig.models.modules.measure_modules import masked_accuracy
 from ludwig.models.modules.measure_modules import perplexity
 from ludwig.models.modules.sequence_decoders import Generator
 from ludwig.models.modules.sequence_decoders import Tagger
+from ludwig.models.modules.sequence_encoders import BERT
 from ludwig.models.modules.sequence_encoders import CNNRNN, PassthroughEncoder
 from ludwig.models.modules.sequence_encoders import EmbedEncoder
 from ludwig.models.modules.sequence_encoders import ParallelCNN
@@ -49,6 +50,8 @@ from ludwig.utils.strings_utils import UNKNOWN_SYMBOL
 from ludwig.utils.strings_utils import build_sequence_matrix
 from ludwig.utils.strings_utils import create_vocabulary
 
+logger = logging.getLogger(__name__)
+
 
 class SequenceBaseFeature(BaseFeature):
     def __init__(self, feature):
@@ -61,8 +64,9 @@ class SequenceBaseFeature(BaseFeature):
         'padding_symbol': PADDING_SYMBOL,
         'unknown_symbol': UNKNOWN_SYMBOL,
         'padding': 'right',
-        'format': 'space',
+        'tokenizer': 'space',
         'lowercase': False,
+        'vocab_file': None,
         'missing_value_strategy': FILL_WITH_CONST,
         'fill_value': ''
     }
@@ -70,9 +74,12 @@ class SequenceBaseFeature(BaseFeature):
     @staticmethod
     def get_feature_meta(column, preprocessing_parameters):
         idx2str, str2idx, str2freq, max_length = create_vocabulary(
-            column, preprocessing_parameters['format'],
+            column, preprocessing_parameters['tokenizer'],
             lowercase=preprocessing_parameters['lowercase'],
-            num_most_frequent=preprocessing_parameters['most_common']
+            num_most_frequent=preprocessing_parameters['most_common'],
+            vocab_file=preprocessing_parameters['vocab_file'],
+            unknown_symbol=preprocessing_parameters['unknown_symbol'],
+            padding_symbol=preprocessing_parameters['padding_symbol'],
         )
         max_length = min(
             preprocessing_parameters['sequence_length_limit'],
@@ -89,12 +96,17 @@ class SequenceBaseFeature(BaseFeature):
     @staticmethod
     def feature_data(column, metadata, preprocessing_parameters):
         sequence_data = build_sequence_matrix(
-            column, metadata['str2idx'],
-            preprocessing_parameters['format'],
-            metadata['max_sequence_length'],
-            preprocessing_parameters['padding_symbol'],
-            preprocessing_parameters['padding'],
-            preprocessing_parameters['lowercase']
+            sequences=column,
+            inverse_vocabulary=metadata['str2idx'],
+            tokenizer_type=preprocessing_parameters['tokenizer'],
+            length_limit=metadata['max_sequence_length'],
+            padding_symbol=preprocessing_parameters['padding_symbol'],
+            padding=preprocessing_parameters['padding'],
+            unknown_symbol=preprocessing_parameters['unknown_symbol'],
+            lowercase=preprocessing_parameters['lowercase'],
+            tokenizer_vocab_file=preprocessing_parameters[
+                'vocab_file'
+            ],
         )
         return sequence_data
 
@@ -102,7 +114,8 @@ class SequenceBaseFeature(BaseFeature):
     def add_feature_data(
             feature,
             dataset_df,
-            data, metadata,
+            data,
+            metadata,
             preprocessing_parameters
     ):
         sequence_data = SequenceInputFeature.feature_data(
@@ -144,7 +157,7 @@ class SequenceInputFeature(SequenceBaseFeature, InputFeature):
             **kwargs
     ):
         placeholder = self._get_input_placeholder()
-        logging.debug('  placeholder: {0}'.format(placeholder))
+        logger.debug('  placeholder: {0}'.format(placeholder))
 
         return self.build_sequence_input(
             placeholder,
@@ -168,7 +181,7 @@ class SequenceInputFeature(SequenceBaseFeature, InputFeature):
             dropout_rate=dropout_rate,
             is_training=is_training
         )
-        logging.debug('  feature_representation: {0}'.format(
+        logger.debug('  feature_representation: {0}'.format(
             feature_representation))
 
         feature_representation = {
@@ -216,7 +229,7 @@ class SequenceOutputFeature(SequenceBaseFeature, OutputFeature):
         }
         self.num_classes = 0
 
-        a = self.overwrite_defaults(feature)
+        _ = self.overwrite_defaults(feature)
 
         self.decoder_obj = self.get_sequence_decoder(feature)
 
@@ -239,6 +252,8 @@ class SequenceOutputFeature(SequenceBaseFeature, OutputFeature):
             hidden,
             hidden_size,
             regularizer=None,
+            dropout_rate=None,
+            is_training=None,
             **kwargs
     ):
         train_mean_loss, eval_loss, output_tensors = self.build_sequence_output(
@@ -624,16 +639,16 @@ class SequenceOutputFeature(SequenceBaseFeature, OutputFeature):
                     'class_similarities_temperature']
 
                 curr_row = 0
-                first_row_lenght = 0
+                first_row_length = 0
                 is_first_row = True
                 for row in similarities:
                     if is_first_row:
-                        first_row_lenght = len(row)
+                        first_row_length = len(row)
                         is_first_row = False
                         curr_row += 1
                     else:
-                        curr_row_lenght = len(row)
-                        if curr_row_lenght != first_row_lenght:
+                        curr_row_length = len(row)
+                        if curr_row_length != first_row_length:
                             raise ValueError(
                                 'The length of row {} of the class_similarities '
                                 'of {} is {}, different from the length of '
@@ -641,13 +656,13 @@ class SequenceOutputFeature(SequenceBaseFeature, OutputFeature):
                                 'the same length.'.format(
                                     curr_row,
                                     output_feature['name'],
-                                    curr_row_lenght,
-                                    first_row_lenght
+                                    curr_row_length,
+                                    first_row_length
                                 )
                             )
                         else:
                             curr_row += 1
-                all_rows_length = first_row_lenght
+                all_rows_length = first_row_length
 
                 if all_rows_length != len(similarities):
                     raise ValueError(
@@ -720,7 +735,7 @@ class SequenceOutputFeature(SequenceBaseFeature, OutputFeature):
             result,
             metadata,
             experiment_dir_name,
-            skip_save_unprocessed_output=False
+            skip_save_unprocessed_output=False,
     ):
         postprocessed = {}
         npy_filename = os.path.join(experiment_dir_name, '{}_{}.npy')
@@ -762,11 +777,13 @@ class SequenceOutputFeature(SequenceBaseFeature, OutputFeature):
                 if len(probs) > 0 and isinstance(probs[0], list):
                     prob = []
                     for i in range(len(probs)):
+                        # todo: should adapt for the case of beam > 1
                         for j in range(len(probs[i])):
                             probs[i][j] = np.max(probs[i][j])
                         prob.append(np.prod(probs[i]))
-                else:
-                    probs = np.amax(probs, axis=-1)
+                elif isinstance(probs, np.ndarray):
+                    if (probs.shape) == 3:  # prob of each class of each token
+                        probs = np.amax(probs, axis=-1)
                     prob = np.prod(probs, axis=-1)
 
                 postprocessed[PROBABILITIES] = probs
@@ -809,7 +826,6 @@ class SequenceOutputFeature(SequenceBaseFeature, OutputFeature):
         set_default_value(output_feature[LOSS],
                           'class_similarities_temperature', 0)
         set_default_value(output_feature[LOSS], 'weight', 1)
-        set_default_value(output_feature[LOSS], 'type', 'softmax_cross_entropy')
 
         if output_feature[LOSS]['type'] == 'sampled_softmax_cross_entropy':
             set_default_value(output_feature[LOSS], 'sampler', 'log_uniform')
@@ -839,8 +855,11 @@ sequence_encoder_registry = {
     'rnn': RNN,
     'cnnrnn': CNNRNN,
     'embed': EmbedEncoder,
+    'bert': BERT,
+    'passthrough': PassthroughEncoder,
+    'null': PassthroughEncoder,
     'none': PassthroughEncoder,
-    'nNone': PassthroughEncoder,
+    'None': PassthroughEncoder,
     None: PassthroughEncoder
 }
 

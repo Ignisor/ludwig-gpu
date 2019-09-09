@@ -27,6 +27,15 @@ import numpy as np
 import pandas as pd
 from pandas.errors import ParserError
 
+logger = logging.getLogger(__name__)
+
+
+def get_abs_path(data_csv_path, file_path):
+    if data_csv_path is not None:
+        return os.path.join(data_csv_path, file_path)
+    else:
+        return file_path
+
 
 def load_csv(data_fp):
     data = []
@@ -40,13 +49,14 @@ def read_csv(data_fp, header=0):
     Helper method to read a csv file. Wraps around pd.read_csv to handle some
     exceptions. Can extend to cover cases as necessary
     :param data_fp: path to the csv file
+    :param header: header argument for pandas to read the csv
     :return: Pandas dataframe with the data
     """
     try:
         df = pd.read_csv(data_fp, header=header)
     except ParserError:
-        logging.warning('Failed to parse the CSV with pandas default way,'
-                        ' trying \ as escape character.')
+        logger.warning('Failed to parse the CSV with pandas default way,'
+                       ' trying \\ as escape character.')
         df = pd.read_csv(data_fp, header=header, escapechar='\\')
 
     return df
@@ -56,7 +66,8 @@ def save_csv(data_fp, data):
     with open(data_fp, 'w', encoding='utf-8') as csv_file:
         writer = csv.writer(csv_file)
         for row in data:
-            if not isinstance(row, collections.Iterable) or isinstance(row, str):
+            if not isinstance(row, collections.Iterable) or isinstance(row,
+                                                                       str):
                 row = [row]
             writer.writerow(row)
 
@@ -84,7 +95,7 @@ def load_hdf5(data_fp):
     data = {}
     with h5py.File(data_fp, 'r') as h5_file:
         for key in h5_file.keys():
-            data[key] = h5_file[key].value
+            data[key] = h5_file[key][()]
     return data
 
 
@@ -171,16 +182,40 @@ def load_pretrained_embeddings(embeddings_path, vocab):
 
 
 def load_glove(file_path):
-    logging.info('  Loading Glove format file {}'.format(file_path))
+    logger.info('  Loading Glove format file {}'.format(file_path))
     embeddings = {}
-    with open(file_path, 'r') as f:
-        for line in f:
+    embedding_size = 0
+
+    # collect embeddings size assuming the first line is correct
+    with open(file_path, 'r', encoding='utf-8') as f:
+        found_line = False
+        while not found_line:
+            line = f.readline()
             if line:
-                split = line.split()
-                word = split[0]
-                embedding = np.array([float(val) for val in split[1:]])
-                embeddings[word] = embedding
-    logging.info('  {0} embeddings loaded'.format(len(embeddings)))
+                embedding_size = len(line.split()) - 1
+                found_line = True
+
+    # collect embeddings
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line_number, line in enumerate(f):
+            if line:
+                try:
+                    split = line.split()
+                    if len(split) != embedding_size + 1:
+                        raise ValueError
+                    word = split[0]
+                    embedding = np.array(
+                        [float(val) for val in split[-embedding_size:]]
+                    )
+                    embeddings[word] = embedding
+                except ValueError:
+                    logger.warning(
+                        'Line {} in the GloVe file {} is malformed, '
+                        'skipping it'.format(
+                            line_number, file_path
+                        )
+                    )
+    logger.info('  {0} embeddings loaded'.format(len(embeddings)))
     return embeddings
 
 
@@ -265,20 +300,89 @@ def text_feature_data_field(text_feature):
     return text_feature['name'] + '_' + text_feature['level']
 
 
-def load_from_file(file_name, field=None, dtype=int):
+def load_from_file(file_name, field=None, dtype=int, ground_truth_split=2):
+    """Load experiment data from supported file formats.
+
+    Experiment data can be test/train statistics, model predictions,
+    probability, ground truth,  ground truth metadata.
+    :param file_name: Path to file to be loaded
+    :param field: Target Prediction field.
+    :param dtype:
+    :param ground_truth_split: Ground truth split filter where 0 is train 1 is
+    validation and 2 is test split. By default test split is used when loading
+    ground truth from hdf5.
+    :return: Experiment data as array
+    """
     if file_name.endswith('.hdf5') and field is not None:
         hdf5_data = h5py.File(file_name, 'r')
-        split = hdf5_data['split'].value
-        column = hdf5_data[field].value
+        split = hdf5_data['split'][()]
+        column = hdf5_data[field][()]
         hdf5_data.close()
-        array = column[split == 2]  # ground truth
+        array = column[split == ground_truth_split]  # ground truth
     elif file_name.endswith('.npy'):
         array = np.load(file_name)
     elif file_name.endswith('.csv'):
-        array = read_csv(file_name, header=None)[0].tolist()
+        array = read_csv(file_name, header=None).values
     else:
         array = load_matrix(file_name, dtype)
     return array
+
+
+def replace_file_extension(file_path, extension):
+    """
+    Return a file path for a file with same name but different format.
+    a.csv, json -> a.json
+    a.csv, hdf5 -> a.hdf5
+    :param file_path: original file path
+    :param extension: file extension
+    :return: file path with same name but different format
+    """
+    if file_path is None:
+        return None
+    if '.' in extension:
+        # Handle the case if the user calls with '.hdf5' instead of 'hdf5'
+        extension = extension.replace('.', '').strip()
+
+    return os.path.splitext(file_path)[0] + '.' + extension
+
+
+def file_exists_with_diff_extension(file_path, extension):
+    return file_path is None or \
+           os.path.isfile(replace_file_extension(file_path, extension))
+
+
+def add_sequence_feature_column(df, col_name, seq_length):
+    """
+    Adds a new column to the dataframe computed from an existing column.
+    Values in the new column are space-delimited strings composed of preceding
+    values of the same column up to seq_length.
+    For example values of the i-th row of the new column will be a
+    space-delimited string of df[col_name][i-seq_length].
+     :param df: input dataframe
+    :param col_name: column name containing sequential data
+    :param seq_length: length of an array of preceeding column values to use
+    """
+
+    if col_name not in df.columns.values:
+        logger.error('{} column does not exist'.format(col_name))
+        return
+
+    new_col_name = col_name + '_feature'
+    if new_col_name in df.columns.values:
+        logger.warning(
+            '{} column already exists, values will be overridden'.format(
+                new_col_name
+            )
+        )
+
+    df[new_col_name] = np.nan
+
+    for i in range(seq_length, len(df)):
+        df.iloc[i, df.columns.get_loc(new_col_name)] = ' '.join(
+            str(j) for j in list((df.iloc[i - seq_length: i][col_name]))
+        )
+
+    df[new_col_name] = df[new_col_name].fillna(method='backfill')
 
 
 class NumpyEncoder(json.JSONEncoder):

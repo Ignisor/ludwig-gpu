@@ -27,10 +27,10 @@ from __future__ import division
 from __future__ import print_function
 
 import argparse
+import copy
 import logging
 import os
 import sys
-from pprint import pformat
 
 import ludwig.contrib
 
@@ -44,7 +44,6 @@ from ludwig.data.postprocessing import postprocess_df, postprocess
 from ludwig.data.preprocessing import build_data
 from ludwig.data.preprocessing import build_dataset
 from ludwig.data.preprocessing import load_metadata
-from ludwig.data.preprocessing import preprocess_for_training
 from ludwig.data.preprocessing import replace_text_feature_level
 from ludwig.globals import MODEL_HYPERPARAMETERS_FILE_NAME
 from ludwig.globals import MODEL_WEIGHTS_FILE_NAME
@@ -52,18 +51,16 @@ from ludwig.globals import TRAIN_SET_METADATA_FILE_NAME
 from ludwig.globals import set_disable_progressbar
 from ludwig.models.model import Model
 from ludwig.models.model import load_model_and_definition
-from ludwig.models.modules.measure_modules import get_best_function
 from ludwig.predict import calculate_overall_stats
-from ludwig.train import get_experiment_dir_name
-from ludwig.train import get_file_names
-from ludwig.train import train
+from ludwig.train import full_train
 from ludwig.train import update_model_definition_with_metadata
 from ludwig.utils.data_utils import read_csv
 from ludwig.utils.data_utils import save_json
 from ludwig.utils.defaults import default_random_seed
 from ludwig.utils.defaults import merge_with_defaults
-from ludwig.utils.misc import get_experiment_description
 from ludwig.utils.print_utils import logging_level_registry
+
+logger = logging.getLogger(__name__)
 
 
 class LudwigModel:
@@ -80,13 +77,13 @@ class LudwigModel:
     :param logging_level: (int, default: `logging.ERROR`) logging level to use
            for logging. Use logging constants like `logging.DEBUG`,
            `logging.INFO` and `logging.ERROR`. By default only errors will be
-           printed.
-
+           printed. It is possible to change the logging_level later by using
+           the set_logging_level method.
 
     # Example usage:
 
     ```python
-    from ludwig import LudwigModel
+    from ludwig.api import LudwigModel
     ```
 
     Train a model:
@@ -121,6 +118,18 @@ class LudwigModel:
     predictions = ludwig_model.predict(data_df=dataframe)
     ```
 
+    Test:
+
+    ```python
+    predictions, test_stats = ludwig_model.test(data_csv=csv_file_path)
+    ```
+
+    or
+
+    ```python
+    predictions, test_stats = ludwig_model.predict(data_df=dataframe)
+    ```
+
     Finally in order to release resources:
 
     ```python
@@ -134,16 +143,32 @@ class LudwigModel:
             model_definition_file=None,
             logging_level=logging.ERROR
     ):
-        logging.getLogger().setLevel(logging_level)
+
+        self.set_logging_level(logging_level)
+
         if model_definition_file is not None:
             with open(model_definition_file, 'r') as def_file:
                 self.model_definition = merge_with_defaults(
-                    yaml.load(def_file)
+                    yaml.safe_load(def_file)
                 )
         else:
-            self.model_definition = merge_with_defaults(model_definition)
+            model_definition_copy = copy.deepcopy(model_definition)
+            self.model_definition = merge_with_defaults(model_definition_copy)
         self.train_set_metadata = None
         self.model = None
+        self.exp_dir_name = ''
+
+    @staticmethod
+    def set_logging_level(logging_level):
+        """
+        :param logging_level: Set/Update the logging level. Use logging
+        constants like `logging.DEBUG` , `logging.INFO` and `logging.ERROR`.
+
+        :return: None
+        """
+        logging.getLogger('ludwig').setLevel(logging_level)
+        if logging_level in {logging.WARNING, logging.ERROR, logging.CRITICAL}:
+            set_disable_progressbar(True)
 
     @staticmethod
     def _read_data(data_csv, data_dict):
@@ -165,7 +190,7 @@ class LudwigModel:
         return data_df
 
     @staticmethod
-    def load(model_dir, logging_level=logging.ERROR):
+    def load(model_dir):
         """This function allows for loading pretrained models
 
 
@@ -174,10 +199,6 @@ class LudwigModel:
         :param model_dir: (string) path to the directory containing the model.
                If the model was trained by the `train` or `experiment` command,
                the model is in `results_dir/experiment_dir/model`.
-        :param logging_level: (int, default: `logging.ERROR`) logging level to
-               use for logging. Use logging constants like `logging.DEBUG`,
-               `logging.INFO` and `logging.ERROR`. By default only errors will
-               be printed.
 
 
         # Return
@@ -193,10 +214,6 @@ class LudwigModel:
 
         """
 
-        logging.getLogger().setLevel(logging_level)
-        if logging_level in {logging.WARNING, logging.ERROR, logging.CRITICAL}:
-            set_disable_progressbar(True)
-
         model, model_definition = load_model_and_definition(model_dir)
         ludwig_model = LudwigModel(model_definition)
         ludwig_model.model = model
@@ -209,7 +226,7 @@ class LudwigModel:
         return ludwig_model
 
     def save(self, save_path):
-        """This function allows for loading pretrained models
+        """This function allows to save models on disk
 
         # Inputs
 
@@ -250,6 +267,28 @@ class LudwigModel:
             model_hyperparameters_path
         )
 
+    def save_for_serving(self, save_path):
+        """This function allows to save models on disk
+
+        # Inputs
+
+        :param  save_path: (string) path to the directory where the SavedModel
+                is going to be saved.
+
+
+        # Example usage
+
+        ```python
+        ludwig_model.save_for_serving(save_path)
+        ```
+
+        """
+        if (self.model is None or self.model.session is None or
+                self.model_definition is None or self.train_set_metadata is None):
+            raise ValueError('Model has not been initialized or loaded')
+
+        self.model.save_savedmodel(save_path)
+
     def close(self):
         """Closes an open LudwigModel (closing the session running it).
         It should be called once done with the model to release resources.
@@ -271,8 +310,12 @@ class LudwigModel:
             data_train_hdf5=None,
             data_validation_hdf5=None,
             data_test_hdf5=None,
+            data_dict=None,
+            data_train_dict=None,
+            data_validation_dict=None,
+            data_test_dict=None,
             train_set_metadata_json=None,
-            dataset_type='generic',
+            experiment_name='api_experiment',
             model_name='run',
             model_load_path=None,
             model_resume_path=None,
@@ -283,8 +326,8 @@ class LudwigModel:
             output_directory='results',
             gpus=None,
             gpu_fraction=1.0,
+            use_horovod=False,
             random_seed=42,
-            logging_level=logging.ERROR,
             debug=False,
             **kwargs
     ):
@@ -322,14 +365,48 @@ class LudwigModel:
                intermediate preprocess  version of the input CSV created the
                first time a CSV file is used in the same directory with the same
                name and a hdf5 extension
+        :param data_dict: (dict) input data dictionary. It is expected to
+               contain one key for each field and the values have to be lists of
+               the same length. Each index in the lists corresponds to one
+               datapoint. For example a data set consisting of two datapoints
+               with a text and a class may be provided as the following dict
+               `{'text_field_name': ['text of the first datapoint', text of the
+               second datapoint'], 'class_filed_name': ['class_datapoints_1',
+               'class_datapoints_2']}`.
+        :param data_train_dict: (dict) input training data dictionary. It is
+               expected to contain one key for each field and the values have
+               to be lists of the same length. Each index in the lists
+               corresponds to one datapoint. For example a data set consisting
+               of two datapoints with a text and a class may be provided as the
+               following dict:
+               `{'text_field_name': ['text of the first datapoint', 'text of the
+               second datapoint'], 'class_field_name': ['class_datapoint_1',
+               'class_datapoint_2']}`.
+        :param data_validation_dict: (dict) input validation data dictionary. It
+               is expected to contain one key for each field and the values have
+               to be lists of the same length. Each index in the lists
+               corresponds to one datapoint. For example a data set consisting
+               of two datapoints with a text and a class may be provided as the
+               following dict:
+               `{'text_field_name': ['text of the first datapoint', 'text of the
+               second datapoint'], 'class_field_name': ['class_datapoint_1',
+               'class_datapoint_2']}`.
+        :param data_test_dict: (dict) input test data dictionary. It is
+               expected to contain one key for each field and the values have
+               to be lists of the same length. Each index in the lists
+               corresponds to one datapoint. For example a data set consisting
+               of two datapoints with a text and a class may be provided as the
+               following dict:
+               `{'text_field_name': ['text of the first datapoint', 'text of the
+               second datapoint'], 'class_field_name': ['class_datapoint_1',
+               'class_datapoint_2']}`.
         :param train_set_metadata_json: (string) input metadata JSON file. It is an
                intermediate preprocess file containing the mappings of the input
                CSV created the first time a CSV file is used in the same
                directory with the same name and a json extension
-        :param dataset_type: (string, default: `'default'`) determines the type
-               of preprocessing will be applied to the data. Only `generic` is
-               available at the moment
-        :param model_name: (string) a name for the model, user for the save
+        :param experiment_name: (string) a name for the experiment, used for the save
+               directory
+        :param model_name: (string) a name for the model, used for the save
                directory
         :param model_load_path: (string) path of a pretrained model to load as
                initialization
@@ -365,10 +442,6 @@ class LudwigModel:
                used anywhere there is a call to a random number generator: data
                splitting, parameter initialization and training set shuffling
         :param debug: (bool, default: `False`) enables debugging mode
-        :param logging_level: (int, default: `logging.ERROR`) logging level to
-               use for logging. Use logging constants like `logging.DEBUG`,
-               `logging.INFO` and `logging.ERROR`. By default only errors will
-               be printed.
 
         There are three ways to provide data: by dataframes using the `_df`
         parameters, by CSV using the `_csv` parameters and by HDF5 and JSON,
@@ -397,35 +470,31 @@ class LudwigModel:
         output feature containing loss and measures values for each epoch.
 
         """
-        logging.getLogger().setLevel(logging_level)
-        if logging_level in {logging.WARNING, logging.ERROR, logging.CRITICAL}:
-            set_disable_progressbar(True)
 
-        # setup directories and file names
-        experiment_dir_name = None
-        if model_resume_path is not None:
-            if os.path.exists(model_resume_path):
-                experiment_dir_name = model_resume_path
-            else:
-                logging.info(
-                    'Model resume path does not exists,'
-                    ' starting training from scratch'
-                )
-                model_resume_path = None
-        if model_resume_path is None:
-            experiment_dir_name = get_experiment_dir_name(
-                output_directory,
-                '',
-                model_name
-            )
-        description_fn, training_stats_fn, model_dir = get_file_names(
-            experiment_dir_name
-        )
+        if data_df is None and data_dict is not None:
+            data_df = pd.DataFrame(data_dict)
 
-        # save description
-        description = get_experiment_description(
+        if data_train_df is None and data_train_dict is not None:
+            data_train_df = pd.DataFrame(data_train_dict)
+
+        if data_validation_df is None and data_validation_dict is not None:
+            data_validation_df = pd.DataFrame(data_validation_dict)
+
+        if data_test_df is None and data_test_dict is not None:
+            data_test_df = pd.DataFrame(data_test_dict)
+
+        (
+            self.model,
+            preprocessed_data,
+            self.exp_dir_name,
+            train_stats,
+            self.model_definition
+        ) = full_train(
             self.model_definition,
-            dataset_type,
+            data_df=data_df,
+            data_train_df=data_train_df,
+            data_validation_df=data_validation_df,
+            data_test_df=data_test_df,
             data_csv=data_csv,
             data_train_csv=data_train_csv,
             data_validation_csv=data_validation_csv,
@@ -434,152 +503,25 @@ class LudwigModel:
             data_train_hdf5=data_train_hdf5,
             data_validation_hdf5=data_validation_hdf5,
             data_test_hdf5=data_test_hdf5,
-            metadata_json=train_set_metadata_json,
-            random_seed=random_seed)
-
-        save_json(description_fn, description)
-
-        # print description
-        logging.info('Model name: {}'.format(model_name))
-        logging.info('Output path: {}'.format(experiment_dir_name))
-        logging.info('\n')
-        for key, value in description.items():
-            logging.info('{0}: {1}'.format(key, pformat(value, indent=4)))
-        logging.info('\n')
-
-        # preprocess
-        if data_df is not None or data_train_df is not None:
-            (
-                training_set,
-                validation_set,
-                test_set,
-                train_set_metadata
-            ) = preprocess_for_training(
-                self.model_definition,
-                dataset_type,
-                data_df=data_df,
-                data_train_df=data_train_df,
-                data_validation_df=data_validation_df,
-                data_test_df=data_test_df,
-                train_set_metadata_json=train_set_metadata_json,
-                skip_save_processed_input=True,
-                preprocessing_params=
-                self.model_definition['preprocessing'],
-                random_seed=random_seed)
-        else:
-            (
-                training_set,
-                validation_set,
-                test_set,
-                train_set_metadata
-            ) = preprocess_for_training(
-                self.model_definition,
-                dataset_type,
-                data_csv=data_csv,
-                data_train_csv=data_train_csv,
-                data_validation_csv=data_validation_csv,
-                data_test_csv=data_test_csv,
-                data_hdf5=data_hdf5,
-                data_train_hdf5=data_train_hdf5,
-                data_validation_hdf5=data_validation_hdf5,
-                data_test_hdf5=data_test_hdf5,
-                train_set_metadata_json=train_set_metadata_json,
-                skip_save_processed_input=skip_save_processed_input,
-                preprocessing_params=
-                self.model_definition['preprocessing'],
-                random_seed=random_seed)
-
-        logging.info('Training set: {0}'.format(training_set.size))
-        if validation_set is not None:
-            logging.info('Validation set: {0}'.format(validation_set.size))
-        if test_set is not None:
-            logging.info('Test set: {0}'.format(test_set.size))
-
-        # update model definition with metadata properties
-        update_model_definition_with_metadata(
-            self.model_definition,
-            train_set_metadata
-        )
-
-        if not skip_save_model:
-            os.makedirs(model_dir, exist_ok=True)
-            train_set_metadata_path = os.path.join(
-                model_dir,
-                TRAIN_SET_METADATA_FILE_NAME
-            )
-            save_json(train_set_metadata_path, train_set_metadata)
-
-        # run the experiment
-        model, result = train(
-            training_set=training_set,
-            validation_set=validation_set,
-            test_set=test_set,
-            model_definition=self.model_definition,
-            save_path=model_dir,
+            train_set_metadata_json=train_set_metadata_json,
+            experiment_name=experiment_name,
+            model_name=model_name,
             model_load_path=model_load_path,
-            resume=model_resume_path is not None,
+            model_resume_path=model_resume_path,
             skip_save_model=skip_save_model,
             skip_save_progress=skip_save_progress,
             skip_save_log=skip_save_log,
+            skip_save_processed_input=skip_save_processed_input,
+            output_directory=output_directory,
+            should_close_session=False,
             gpus=gpus,
             gpu_fraction=gpu_fraction,
+            use_horovod=use_horovod,
             random_seed=random_seed,
-            debug=debug
+            debug=debug,
         )
 
-        train_trainset_stats, train_valisest_stats, train_testset_stats = result
-        train_stats = {
-            'train': train_trainset_stats,
-            'validation': train_valisest_stats,
-            'test': train_testset_stats
-        }
-
-        # save training and test statistics
-        save_json(training_stats_fn, train_stats)
-
-        # grab the results of the model with highest validation test performance
-        md_training = self.model_definition['training']
-        validation_field = md_training['validation_field']
-        validation_measure = md_training['validation_measure']
-        validation_field_result = train_valisest_stats[validation_field]
-
-        best_function = get_best_function(validation_measure)
-
-        # print results of the model with highest validation test performance
-        if validation_set is not None:
-            # max or min depending on the measure
-            epoch_best_vali_measure, best_vali_measure = best_function(
-                enumerate(validation_field_result[validation_measure]),
-                key=lambda pair: pair[1]
-            )
-            logging.info('Best validation model epoch: {0}'.format(
-                epoch_best_vali_measure + 1)
-            )
-            logging.info(
-                'Best validation model {0} on validation set {1}: {2}'.format(
-                    validation_measure,
-                    validation_field,
-                    best_vali_measure)
-            )
-
-            if test_set is not None:
-                best_vali_measure_epoch_test_measure = train_testset_stats[
-                    validation_field
-                ][validation_measure][epoch_best_vali_measure]
-                logging.info(
-                    'Best validation model {0} on test set {1}: {2}'.format(
-                        validation_measure,
-                        validation_field,
-                        best_vali_measure_epoch_test_measure
-                    )
-                )
-
-        logging.info('Finished: {0}'.format(model_name))
-        logging.info('Saved to {0}:'.format(experiment_dir_name))
-
-        # set parameters
-        self.model = model
-        self.train_set_metadata = train_set_metadata
+        self.train_set_metadata = preprocessed_data[-1]
 
         return train_stats
 
@@ -590,7 +532,6 @@ class LudwigModel:
             gpus=None,
             gpu_fraction=1,
             random_seed=default_random_seed,
-            logging_level=logging.ERROR,
             debug=False,
             **kwargs
     ):
@@ -615,15 +556,8 @@ class LudwigModel:
         :param random_seed: (int, default`42`) a random seed that is going to be
                used anywhere there is a call to a random number generator: data
                splitting, parameter initialization and training set shuffling
-        :param logging_level: (int, default: `logging.ERROR`) logging level to
-               use for logging. Use logging constants like `logging.DEBUG`,
-               `logging.INFO` and `logging.ERROR`. By default only errors will
-               be printed.
         :param debug: (bool, default: `False`) enables debugging mode
         """
-        logging.getLogger().setLevel(logging_level)
-        if logging_level in {logging.WARNING, logging.ERROR, logging.CRITICAL}:
-            set_disable_progressbar(True)
 
         if train_set_metadata is None and train_set_metadata_json is None:
             raise ValueError(
@@ -665,7 +599,6 @@ class LudwigModel:
             bucketing_field=None,
             gpus=None,
             gpu_fraction=1,
-            logging_level=logging.ERROR,
     ):
         """This function is used to perform one epoch of training of the model 
         on the specified dataset.
@@ -698,10 +631,6 @@ class LudwigModel:
                same syntax of CUDA_VISIBLE_DEVICES)
         :param gpu_fraction: (float, default `1.0`) fraction of GPU memory to
                initialize the process with
-        :param logging_level: (int, default: `logging.ERROR`) logging level to
-               use for logging. Use logging constants like `logging.DEBUG`,
-               `logging.INFO` and `logging.ERROR`. By default only errors will
-               be printed.
 
         There are three ways to provide data: by dataframes using the `data_df`
         parameter, by CSV using the `data_csv` parameter and by dictionary,
@@ -716,9 +645,6 @@ class LudwigModel:
         text of the second datapoint'], 'class_filed_name':
         ['class_datapoints_1', 'class_datapoints_2']}`.
         """
-        logging.getLogger().setLevel(logging_level)
-        if logging_level in {logging.WARNING, logging.ERROR, logging.CRITICAL}:
-            set_disable_progressbar(True)
 
         if (self.model is None or self.model_definition is None
                 or self.train_set_metadata is None):
@@ -743,7 +669,7 @@ class LudwigModel:
                 'bucketing_field'
             ]
 
-        logging.debug('Preprocessing {} datapoints'.format(len(data_df)))
+        logger.debug('Preprocessing {} datapoints'.format(len(data_df)))
         features_to_load = (self.model_definition['input_features'] +
                             self.model_definition['output_features'])
         preprocessed_data = build_data(
@@ -764,7 +690,7 @@ class LudwigModel:
             None
         )
 
-        logging.debug('Training batch')
+        logger.debug('Training batch')
         self.model.train_online(
             dataset,
             batch_size=batch_size,
@@ -782,14 +708,11 @@ class LudwigModel:
             data_dict=None,
             return_type=pd.DataFrame,
             batch_size=128,
+            evaluate_performance=False,
+            skip_save_unprocessed_output=False,
             gpus=None,
             gpu_fraction=1,
-            only_predictions=True,
-            logging_level=logging.ERROR,
     ):
-        logging.getLogger().setLevel(logging_level)
-        if logging_level in {logging.WARNING, logging.ERROR, logging.CRITICAL}:
-            set_disable_progressbar(True)
 
         if (self.model is None or self.model_definition is None or
                 self.train_set_metadata is None):
@@ -798,10 +721,18 @@ class LudwigModel:
         if data_df is None:
             data_df = self._read_data(data_csv, data_dict)
 
-        logging.debug('Preprocessing {} datapoints'.format(len(data_df)))
-        features_to_load = self.model_definition['input_features']
-        if not only_predictions:
-            features_to_load += self.model_definition['output_features']
+        logger.debug('Preprocessing {} datapoints'.format(len(data_df)))
+        # Added [:] to next line, before I was just assigning,
+        # this way I'm copying the list. If you don't do it, you are actually
+        # modifying the input feature list when you add output features,
+        # which you definitely don't want to do
+        features_to_load = self.model_definition['input_features'][:]
+        if evaluate_performance:
+            output_features = self.model_definition['output_features']
+        else:
+            output_features = []
+        features_to_load += output_features
+
         preprocessed_data = build_data(
             data_df,
             features_to_load,
@@ -809,29 +740,27 @@ class LudwigModel:
             self.model_definition['preprocessing']
         )
         replace_text_feature_level(
-            self.model_definition['input_features'] +
-            ([] if only_predictions else self.model_definition[
-                'output_features']),
+            features_to_load,
             [preprocessed_data]
         )
         dataset = Dataset(
             preprocessed_data,
             self.model_definition['input_features'],
-            [] if only_predictions
-            else self.model_definition['output_features'],
+            output_features,
             None
         )
 
-        logging.debug('Predicting')
+        logger.debug('Predicting')
         predict_results = self.model.predict(
             dataset,
             batch_size,
-            only_predictions=only_predictions,
-            gpus=gpus, gpu_fraction=gpu_fraction,
+            evaluate_performance=evaluate_performance,
+            gpus=gpus,
+            gpu_fraction=gpu_fraction,
             session=getattr(self.model, 'session', None)
         )
 
-        if not only_predictions:
+        if evaluate_performance:
             calculate_overall_stats(
                 predict_results,
                 self.model_definition['output_features'],
@@ -839,7 +768,7 @@ class LudwigModel:
                 self.train_set_metadata
             )
 
-        logging.debug('Postprocessing')
+        logger.debug('Postprocessing')
         if (
                 return_type == 'dict' or
                 return_type == 'dictionary' or
@@ -848,7 +777,9 @@ class LudwigModel:
             postprocessed_predictions = postprocess(
                 predict_results,
                 self.model_definition['output_features'],
-                self.train_set_metadata
+                self.train_set_metadata,
+                experiment_dir_name=self.exp_dir_name,
+                skip_save_unprocessed_output=skip_save_unprocessed_output,
             )
         elif (
                 return_type == 'dataframe' or
@@ -858,17 +789,21 @@ class LudwigModel:
             postprocessed_predictions = postprocess_df(
                 predict_results,
                 self.model_definition['output_features'],
-                self.train_set_metadata
+                self.train_set_metadata,
+                experiment_dir_name=self.exp_dir_name,
+                skip_save_unprocessed_output=skip_save_unprocessed_output,
             )
         else:
-            logging.warning(
+            logger.warning(
                 'Unrecognized return_type: {}. '
                 'Returning DataFrame.'.format(return_type)
             )
             postprocessed_predictions = postprocess(
                 predict_results,
                 self.model_definition['output_features'],
-                self.train_set_metadata
+                self.train_set_metadata,
+                experiment_dir_name=self.exp_dir_name,
+                skip_save_unprocessed_output=skip_save_unprocessed_output,
             )
 
         return postprocessed_predictions, predict_results
@@ -882,7 +817,7 @@ class LudwigModel:
             batch_size=128,
             gpus=None,
             gpu_fraction=1,
-            logging_level=logging.ERROR,
+            skip_save_unprocessed_output=True
     ):
         """This function is used to predict the output variables given the input
            variables using the trained model.
@@ -908,15 +843,15 @@ class LudwigModel:
                DataFrame , while `'dict'`, ''dictionary'` and `dict` will
                return a dictionary.
         :param batch_size: (int, default: `128`) batch size
+        :param skip_save_unprocessed_output: If this parameter is False,
+               predictions and their probabilities are saved in both raw
+               unprocessed numpy files contaning tensors and as postprocessed
+               CSV files (one for each output feature). If this parameter is
+               True, only the CSV ones are saved and the numpy ones are skipped.
         :param gpus: (string, default: `None`) list of GPUs to use (it uses the
                same syntax of CUDA_VISIBLE_DEVICES)
         :param gpu_fraction: (float, default `1.0`) fraction of gpu memory to
                initialize the process with
-        :param logging_level: (int, default: `logging.ERROR`) logging level to
-               use for logging. Use logging constants like `logging.DEBUG`,
-               `logging.INFO` and `logging.ERROR`. By default only errors will
-               be printed.
-
 
         # Return
 
@@ -941,9 +876,10 @@ class LudwigModel:
             data_dict=data_dict,
             return_type=return_type,
             batch_size=batch_size,
+            evaluate_performance=False,
+            skip_save_unprocessed_output=skip_save_unprocessed_output,
             gpus=gpus,
             gpu_fraction=gpu_fraction,
-            logging_level=logging_level,
         )
 
         return predictions
@@ -955,9 +891,9 @@ class LudwigModel:
             data_dict=None,
             return_type=pd.DataFrame,
             batch_size=128,
+            skip_save_unprocessed_output=False,
             gpus=None,
             gpu_fraction=1,
-            logging_level=logging.ERROR,
     ):
         """This function is used to predict the output variables given the input
         variables using the trained model and compute test statistics like
@@ -986,15 +922,15 @@ class LudwigModel:
                DataFrame , while `'dict'`, ''dictionary'` and `dict` will
                return a dictionary.
         :param batch_size: (int, default: `128`) batch size
+        :param skip_save_unprocessed_output: If this parameter is False,
+               predictions and their probabilities are saved in both raw
+               unprocessed numpy files contaning tensors and as postprocessed
+               CSV files (one for each output feature). If this parameter is
+               True, only the CSV ones are saved and the numpy ones are skipped.
         :param gpus: (string, default: `None`) list of GPUs to use (it uses the
                same syntax of CUDA_VISIBLE_DEVICES)
         :param gpu_fraction: (float, default `1.0`) fraction of GPU memory to
                initialize the process with
-        :param logging_level: (int, default: `logging.ERROR`) logging level to
-               use for logging. Use logging constants like `logging.DEBUG`,
-               `logging.INFO` and `logging.ERROR`. By default only errors will
-               be printed.
-
 
         # Return
 
@@ -1025,10 +961,10 @@ class LudwigModel:
             data_dict=data_dict,
             return_type=return_type,
             batch_size=batch_size,
+            evaluate_performance=True,
+            skip_save_unprocessed_output=skip_save_unprocessed_output,
             gpus=gpus,
             gpu_fraction=gpu_fraction,
-            only_predictions=False,
-            logging_level=logging_level,
         )
 
         return predictions, test_stats
@@ -1044,20 +980,16 @@ def test_train(
         logging_level=logging.ERROR,
         **kwargs
 ):
-    ludwig_model = LudwigModel(
-        model_definition,
-        logging_level=logging_level
-    )
+    ludwig_model = LudwigModel(model_definition, logging_level=logging_level)
 
     train_stats = ludwig_model.train(
         data_csv=data_csv,
         gpus=gpus,
         gpu_fraction=gpu_fraction,
-        logging_level=logging_level,
         debug=debug
     )
 
-    logging.critical(train_stats)
+    logger.critical(train_stats)
 
     # predict
     predictions = ludwig_model.predict(
@@ -1065,11 +997,10 @@ def test_train(
         batch_size=batch_size,
         gpus=gpus,
         gpu_fraction=gpu_fraction,
-        logging_level=logging_level
     )
 
     ludwig_model.close()
-    logging.critical(predictions)
+    logger.critical(predictions)
 
 
 def test_train_online(
@@ -1091,24 +1022,19 @@ def test_train_online(
     )
 
     ludwig_model = LudwigModel(model_definition, logging_level=logging_level)
-    ludwig_model.initialize_model(
-        train_set_metadata=train_set_metadata,
-        logging_level=logging_level
-    )
+    ludwig_model.initialize_model(train_set_metadata=train_set_metadata)
 
     ludwig_model.train_online(
         data_csv=data_csv,
         batch_size=128,
         gpus=gpus,
         gpu_fraction=gpu_fraction,
-        logging_level=logging_level
     )
     ludwig_model.train_online(
         data_csv=data_csv,
         batch_size=128,
         gpus=gpus,
         gpu_fraction=gpu_fraction,
-        logging_level=logging_level
     )
 
     # predict
@@ -1117,10 +1043,9 @@ def test_train_online(
         batch_size=batch_size,
         gpus=gpus,
         gpu_fraction=gpu_fraction,
-        logging_level=logging_level
     )
     ludwig_model.close()
-    logging.critical(predictions)
+    logger.critical(predictions)
 
 
 def test_predict(
@@ -1132,31 +1057,26 @@ def test_predict(
         logging_level=logging.ERROR,
         **kwargs
 ):
-    ludwig_model = LudwigModel.load(
-        model_path,
-        logging_level=logging_level
-    )
+    ludwig_model = LudwigModel.load(model_path)
 
     predictions = ludwig_model.predict(
         data_csv=data_csv,
         batch_size=batch_size,
         gpus=gpus,
         gpu_fraction=gpu_fraction,
-        logging_level=logging_level
     )
 
     ludwig_model.close()
-    logging.critical(predictions)
+    logger.critical(predictions)
 
     predictions = ludwig_model.predict(
         data_csv=data_csv,
         batch_size=batch_size,
         gpus=gpus,
         gpu_fraction=gpu_fraction,
-        logging_level=logging_level
     )
 
-    logging.critical(predictions)
+    logger.critical(predictions)
 
 
 def main(sys_argv):
@@ -1188,7 +1108,7 @@ def main(sys_argv):
     parser.add_argument(
         '-md',
         '--model_definition',
-        type=yaml.load,
+        type=yaml.safe_load,
         help='model definition'
     )
 
@@ -1238,14 +1158,6 @@ def main(sys_argv):
     args = parser.parse_args(sys_argv)
     args.logging_level = logging_level_registry[args.logging_level]
 
-    logging.basicConfig(
-        stream=sys.stdout,
-        # filename='log.log',
-        # filemode='w',
-        level=args.logging_level,
-        format='%(message)s'
-    )
-
     if args.test == 'train':
         test_train(**vars(args))
     elif args.test == 'train_online':
@@ -1253,7 +1165,7 @@ def main(sys_argv):
     elif args.test == 'predict':
         test_predict(**vars(args))
     else:
-        logging.info('Unsupported test type')
+        logger.info('Unsupported test type')
 
 
 if __name__ == '__main__':

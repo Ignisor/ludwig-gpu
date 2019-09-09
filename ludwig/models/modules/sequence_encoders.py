@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import collections
 import logging
+import re
 
 import tensorflow as tf
 
@@ -24,6 +26,11 @@ from ludwig.models.modules.embedding_modules import EmbedSequence
 from ludwig.models.modules.fully_connected_modules import FCStack
 from ludwig.models.modules.recurrent_modules import RecurrentStack
 from ludwig.models.modules.reduction_modules import reduce_sequence
+
+logger = logging.getLogger(__name__)
+
+
+logger = logging.getLogger(__name__)
 
 
 class PassthroughEncoder:
@@ -374,7 +381,6 @@ class ParallelCNN(object):
                    (which does not reduce and returns the full tensor).
             :type reduce_output: str
         """
-        self.should_embed = should_embed
 
         if conv_layers is not None and num_conv_layers is None:
             # use custom-defined layers
@@ -395,40 +401,41 @@ class ParallelCNN(object):
             self.num_conv_layers = 4
         else:
             raise ValueError(
-                'Invalid layer parametrization, use either conv_layers or num_conv_layers')
+                'Invalid layer parametrization, use either conv_layers or'
+                ' num_conv_layers'
+            )
 
-        if fc_layers is not None and num_fc_layers is None:
-            # use custom-defined layers
-            fc_layers = fc_layers
-            num_fc_layers = len(fc_layers)
-        elif fc_layers is None and num_fc_layers is not None:
-            # generate num_fc_layers with default parameters
-            fc_layers = None
-            num_fc_layers = num_fc_layers
-        elif fc_layers is None and num_fc_layers is None:
+        # The user is expected to provide fc_layers or num_fc_layers
+        # The following logic handles the case where the user either provides
+        # both or neither.
+        if fc_layers is None and num_fc_layers is None:
             # use default layers with varying filter sizes
             fc_layers = [
                 {'fc_size': 512},
                 {'fc_size': 256}
             ]
             num_fc_layers = 2
-        else:
+        elif fc_layers is not None and num_fc_layers is not None:
             raise ValueError(
-                'Invalid layer parametrization, use either fc_layers or num_fc_layers')
+                'Invalid layer parametrization, use either fc_layers or '
+                'num_fc_layers only. Not both.'
+            )
 
         self.reduce_output = reduce_output
-
-        self.embed_sequence = EmbedSequence(
-            vocab,
-            embedding_size,
-            representation=representation,
-            embeddings_trainable=embeddings_trainable,
-            pretrained_embeddings=pretrained_embeddings,
-            embeddings_on_cpu=embeddings_on_cpu,
-            dropout=dropout,
-            initializer=initializer,
-            regularize=regularize
-        )
+        self.should_embed = should_embed
+        self.embed_sequence = None
+        if self.should_embed:
+            self.embed_sequence = EmbedSequence(
+                vocab,
+                embedding_size,
+                representation=representation,
+                embeddings_trainable=embeddings_trainable,
+                pretrained_embeddings=pretrained_embeddings,
+                embeddings_on_cpu=embeddings_on_cpu,
+                dropout=dropout,
+                initializer=initializer,
+                regularize=regularize
+            )
 
         self.parallel_conv_1d = ParallelConv1D(
             layers=self.conv_layers,
@@ -486,11 +493,11 @@ class ParallelCNN(object):
             while len(embedded_input_sequence.shape) < 3:
                 embedded_input_sequence = tf.expand_dims(
                     embedded_input_sequence, -1)
-            embedding_size = 1
+            embedding_size = embedded_input_sequence.shape[-1]
 
         # shape=(?, sequence_length, embedding_size)
         hidden = embedded_input_sequence
-        logging.debug('  hidden: {0}'.format(hidden))
+        logger.debug('  hidden: {0}'.format(hidden))
 
         # ================ Conv Layers ================
         hidden = self.parallel_conv_1d(
@@ -503,7 +510,7 @@ class ParallelCNN(object):
         hidden_size = sum(
             [conv_layer['num_filters'] for conv_layer in self.conv_layers]
         )
-        logging.debug('  hidden: {0}'.format(hidden))
+        logger.debug('  hidden: {0}'.format(hidden))
 
         # ================ Sequence Reduction ================
         if self.reduce_output is not None:
@@ -511,7 +518,7 @@ class ParallelCNN(object):
 
             # ================ FC Layers ================
             hidden_size = hidden.shape.as_list()[-1]
-            logging.debug('  flatten hidden: {0}'.format(hidden))
+            logger.debug('  flatten hidden: {0}'.format(hidden))
 
             hidden = self.fc_stack(
                 hidden,
@@ -733,41 +740,41 @@ class StackedCNN:
             self.num_conv_layers = 6
         else:
             raise ValueError(
-                'Invalid layer parametrization, use either conv_layers or num_conv_layers')
+                'Invalid layer parametrization, use either conv_layers or '
+                'num_conv_layers'
+            )
 
-        if fc_layers is not None and num_fc_layers is None:
-            # use custom-defined layers
-            fc_layers = fc_layers
-            num_fc_layers = len(fc_layers)
-        elif fc_layers is None and num_fc_layers is not None:
-            # generate num_fc_layers with default parameters
-            fc_layers = None
-            num_fc_layers = num_fc_layers
-        elif fc_layers is None and num_fc_layers is None:
+        # The user is expected to provide fc_layers or num_fc_layers
+        # The following logic handles the case where the user either provides
+        # both or neither.
+        if fc_layers is None and num_fc_layers is None:
             # use default layers with varying filter sizes
             fc_layers = [
                 {'fc_size': 512},
                 {'fc_size': 256}
             ]
             num_fc_layers = 2
-        else:
+        elif fc_layers is not None and num_fc_layers is not None:
             raise ValueError(
-                'Invalid layer parametrization, use either fc_layers or num_fc_layers')
+                'Invalid layer parametrization, use either fc_layers or '
+                'num_fc_layers only. Not both.'
+            )
 
-        self.should_embed = should_embed
         self.reduce_output = reduce_output
-
-        self.embed_sequence = EmbedSequence(
-            vocab,
-            embedding_size,
-            representation=representation,
-            embeddings_trainable=embeddings_trainable,
-            pretrained_embeddings=pretrained_embeddings,
-            embeddings_on_cpu=embeddings_on_cpu,
-            dropout=dropout,
-            initializer=initializer,
-            regularize=regularize
-        )
+        self.should_embed = should_embed
+        self.embed_sequence = None
+        if self.should_embed:
+            self.embed_sequence = EmbedSequence(
+                vocab,
+                embedding_size,
+                representation=representation,
+                embeddings_trainable=embeddings_trainable,
+                pretrained_embeddings=pretrained_embeddings,
+                embeddings_on_cpu=embeddings_on_cpu,
+                dropout=dropout,
+                initializer=initializer,
+                regularize=regularize
+            )
 
         self.conv_stack_1d = ConvStack1D(
             layers=self.conv_layers,
@@ -828,7 +835,7 @@ class StackedCNN:
             self.embedding_size = embedded_input_sequence.shape[-1]
 
         hidden = embedded_input_sequence
-        logging.debug('  hidden: {0}'.format(hidden))
+        logger.debug('  hidden: {0}'.format(hidden))
 
         # ================ Conv Layers ================
         with tf.variable_scope('stack_conv'):
@@ -840,7 +847,7 @@ class StackedCNN:
                 is_training=is_training
             )
         hidden_size = self.conv_layers[-1]['num_filters']
-        logging.debug('  hidden: {0}'.format(hidden))
+        logger.debug('  hidden: {0}'.format(hidden))
 
         # ================ Sequence Reduction ================
         if self.reduce_output is not None:
@@ -848,7 +855,7 @@ class StackedCNN:
 
             # ================ FC Layers ================
             hidden_size = hidden.shape.as_list()[-1]
-            logging.debug('  flatten hidden: {0}'.format(hidden))
+            logger.debug('  flatten hidden: {0}'.format(hidden))
 
             hidden = self.fc_stack(
                 hidden,
@@ -1067,41 +1074,41 @@ class StackedParallelCNN:
             self.num_stacked_layers = 6
         else:
             raise ValueError(
-                'Invalid layer parametrization, use either stacked_layers or num_stacked_layers')
+                'Invalid layer parametrization, use either stacked_layers or'
+                ' num_stacked_layers'
+            )
 
-        if fc_layers is not None and num_fc_layers is None:
-            # use custom-defined layers
-            fc_layers = fc_layers
-            num_fc_layers = len(fc_layers)
-        elif fc_layers is None and num_fc_layers is not None:
-            # generate num_fc_layers with default parameters
-            fc_layers = None
-            num_fc_layers = num_fc_layers
-        elif fc_layers is None and num_fc_layers is None:
+        # The user is expected to provide fc_layers or num_fc_layers
+        # The following logic handles the case where the user either provides
+        # both or neither.
+        if fc_layers is None and num_fc_layers is None:
             # use default layers with varying filter sizes
             fc_layers = [
                 {'fc_size': 512},
                 {'fc_size': 256}
             ]
             num_fc_layers = 2
-        else:
+        elif fc_layers is not None and num_fc_layers is not None:
             raise ValueError(
-                'Invalid layer parametrization, use either fc_layers or num_fc_layers')
+                'Invalid layer parametrization, use either fc_layers or '
+                'num_fc_layers only. Not both.'
+            )
 
-        self.should_embed = should_embed
         self.reduce_output = reduce_output
-
-        self.embed_sequence = EmbedSequence(
-            vocab,
-            embedding_size,
-            representation=representation,
-            embeddings_trainable=embeddings_trainable,
-            pretrained_embeddings=pretrained_embeddings,
-            embeddings_on_cpu=embeddings_on_cpu,
-            dropout=dropout,
-            initializer=initializer,
-            regularize=regularize
-        )
+        self.should_embed = should_embed
+        self.embed_sequence = None
+        if self.should_embed:
+            self.embed_sequence = EmbedSequence(
+                vocab,
+                embedding_size,
+                representation=representation,
+                embeddings_trainable=embeddings_trainable,
+                pretrained_embeddings=pretrained_embeddings,
+                embeddings_on_cpu=embeddings_on_cpu,
+                dropout=dropout,
+                initializer=initializer,
+                regularize=regularize
+            )
 
         self.stack_parallel_conv_1d = StackParallelConv1D(
             stacked_layers=self.stacked_layers,
@@ -1166,7 +1173,7 @@ class StackedParallelCNN:
             self.embedding_size = embedded_input_sequence.shape[-1]
 
         hidden = embedded_input_sequence
-        logging.debug('  hidden: {0}'.format(hidden))
+        logger.debug('  hidden: {0}'.format(hidden))
 
         # ================ Conv Layers ================
         with tf.variable_scope('stack_parallel_conv'):
@@ -1180,7 +1187,7 @@ class StackedParallelCNN:
         hidden_size = 0
         for stack in self.stacked_layers:
             hidden_size += stack[-1]['num_filters']
-        logging.debug('  hidden: {0}'.format(hidden))
+        logger.debug('  hidden: {0}'.format(hidden))
 
         # ================ Sequence Reduction ================
         if self.reduce_output is not None:
@@ -1188,7 +1195,7 @@ class StackedParallelCNN:
 
             # ================ FC Layers ================
             hidden_size = hidden.shape.as_list()[-1]
-            logging.debug('  flatten hidden: {0}'.format(hidden))
+            logger.debug('  flatten hidden: {0}'.format(hidden))
 
             hidden = self.fc_stack(
                 hidden,
@@ -1406,7 +1413,7 @@ class RNN:
                     -1
                 )
             self.embedding_size = embedded_input_sequence.shape[-1]
-        logging.debug('  hidden: {0}'.format(embedded_input_sequence))
+        logger.debug('  hidden: {0}'.format(embedded_input_sequence))
 
         # ================ RNN ================
         hidden, hidden_size = self.recurrent_stack(
@@ -1553,7 +1560,9 @@ class CNNRNN:
             self.num_conv_layers = 2
         else:
             raise ValueError(
-                'Invalid layer parametrization, use either conv_layers or num_conv_layers')
+                'Invalid layer parametrization, use either conv_layers or '
+                'num_conv_layers'
+            )
 
         self.should_embed = should_embed
 
@@ -1630,7 +1639,7 @@ class CNNRNN:
 
         hidden = embedded_input_sequence
         # shape=(?, sequence_length, embedding_size)
-        logging.debug('  hidden: {0}'.format(hidden))
+        logger.debug('  hidden: {0}'.format(hidden))
 
         # ================ CNN ================
         hidden = self.conv_stack_1d(
@@ -1640,7 +1649,7 @@ class CNNRNN:
             dropout_rate=dropout_rate,
             is_training=is_training
         )
-        logging.debug('  hidden: {0}'.format(hidden))
+        logger.debug('  hidden: {0}'.format(hidden))
 
         # ================ RNN ================
         hidden, hidden_size = self.recurrent_stack(
@@ -1651,3 +1660,118 @@ class CNNRNN:
         )
 
         return hidden, hidden_size
+
+
+class BERT:
+
+    def __init__(
+            self,
+            config_path,
+            checkpoint_path=None,
+            do_lower_case=True,
+            reduce_output=True,
+            **kwargs
+    ):
+
+        try:
+            from bert.modeling import BertConfig
+        except ImportError:
+            raise ValueError(
+                "Please install bert-tensorflow: pip install bert-tensorflow"
+            )
+
+        self.checkpoint_path = checkpoint_path
+        self.do_lower_case = do_lower_case
+
+        if config_path is None or checkpoint_path is None:
+            raise ValueError(
+                'BERT config and model checkpoint paths are required'
+            )
+
+        self.bert_config = BertConfig.from_json_file(config_path)
+        self.reduce_output = reduce_output
+
+    def __call__(
+            self,
+            input_sequence,
+            regularizer,
+            dropout_rate,
+            is_training=True
+    ):
+        try:
+            from bert.modeling import BertModel
+            from bert.tokenization import validate_case_matches_checkpoint
+        except ImportError:
+            raise ValueError(
+                "Please install bert-tensorflow: pip install bert-tensorflow"
+            )
+
+        model = BertModel(
+            config=self.bert_config,
+            is_training=True,
+            input_ids=input_sequence,
+            input_mask=tf.sign(tf.abs(input_sequence)),
+            token_type_ids=tf.zeros_like(input_sequence),
+        )
+
+        # initialize weights from the checkpoint file
+        if self.checkpoint_path is not None:
+            validate_case_matches_checkpoint(
+                self.do_lower_case,
+                self.checkpoint_path
+            )
+
+            tvars = tf.trainable_variables()
+            prefix = tvars[0].name.split('/')[0] + '/'
+            (
+                assignment_map,
+                initialized_variable_names
+            ) = BERT.get_assignment_map_from_checkpoint(
+                tvars,
+                self.checkpoint_path,
+                prefix=prefix
+            )
+
+            tf.train.init_from_checkpoint(
+                self.checkpoint_path,
+                assignment_map
+            )
+
+        if self.reduce_output:
+            hidden = model.get_pooled_output()
+            hidden = tf.layers.dropout(hidden, rate=0.1, training=is_training)
+        else:
+            # this assumes the BERT tokenizer is used which adds [CLS] and [SEP]
+            # an it removes first and last token, returning a [b, s, h] where
+            # s is the lenght of the original sequence without
+            # the 2 additional special tokens
+            hidden = model.get_sequence_output()[:, 1:-1, :]
+
+        return hidden, hidden.shape[-1].value
+
+    @staticmethod
+    def get_assignment_map_from_checkpoint(tvars, init_checkpoint, prefix=''):
+        """Compute the union of the current variables and checkpoint variables."""
+        initialized_variable_names = {}
+
+        name_to_variable = collections.OrderedDict()
+        for var in tvars:
+            name = var.name
+            m = re.match("^(.*):\\d+$", name)
+            if m is not None:
+                name = m.group(1)
+            name_to_variable[name] = var
+
+        init_vars = tf.train.list_variables(init_checkpoint)
+
+        assignment_map = collections.OrderedDict()
+        for x in init_vars:
+            (name, var) = (x[0], x[1])
+            prefixed_name = prefix + name
+            if prefixed_name not in name_to_variable:
+                continue
+            assignment_map[name] = prefixed_name
+            initialized_variable_names[name] = 1
+            initialized_variable_names[name + ":0"] = 1
+
+        return (assignment_map, initialized_variable_names)

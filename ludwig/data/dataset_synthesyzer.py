@@ -15,18 +15,57 @@
 # limitations under the License.
 # ==============================================================================
 import argparse
-import numpy as np
 import os
 import random
 import string
 import uuid
+
+import numpy as np
 import yaml
+import soundfile as sf
 from skimage.io import imsave
 
 from ludwig.utils.data_utils import save_csv
+from ludwig.constants import VECTOR
+from ludwig.utils.h3_util import components_to_h3
 from ludwig.utils.misc import get_from_registry
 
 letters = string.ascii_letters
+
+DATETIME_FORMATS = {
+    '%m-%d-%Y': '{m:02d}-{d:02d}-{Y:04d}',
+    '%m-%d-%Y %H:%M:%S': '{m:02d}-{d:02d}-{Y:04d} {H:02d}:{M:02d}:{S:02d}',
+    '%m/%d/%Y': '{m:02d}/{d:02d}/{Y:04d}',
+    '%m/%d/%Y %H:%M:%S': '{m:02d}/{d:02d}/{Y:04d} {H:02d}:{M:02d}:{S:02d}',
+    '%m-%d-%y': '{m:02d}-{d:02d}-{y:02d}',
+    '%m-%d-%y %H:%M:%S': '{m:02d}-{d:02d}-{y:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%m/%d/%y': '{m:02d}/{d:02d}/{y:02d}',
+    '%m/%d/%y %H:%M:%S': '{m:02d}/{d:02d}/{y:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%d-%m-%Y': '{d:02d}-{m:02d}-{Y:04d}',
+    '%d-%m-%Y %H:%M:%S': '{d:02d}-{m:02d}-{Y:04d} {H:02d}:{M:02d}:{S:02d}',
+    '%d/%m/%Y': '{d:02d}/{m:02d}/{Y:04d}',
+    '%d/%m/%Y %H:%M:%S': '{d:02d}/{m:02d}/{Y:04d} {H:02d}:{M:02d}:{S:02d}',
+    '%d-%m-%y': '{d:02d}-{m:02d}-{y:02d}',
+    '%d-%m-%y %H:%M:%S': '{d:02d}-{m:02d}-{y:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%d/%m/%y': '{d:02d}/{m:02d}/{y:02d}',
+    '%d/%m/%y %H:%M:%S': '{d:02d}/{m:02d}/{y:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%y-%m-%d': '{y:02d}-{m:02d}-{d:02d}',
+    '%y-%m-%d %H:%M:%S': '{y:02d}-{m:02d}-{d:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%y/%m/%d': '{y:02d}/{m:02d}/{d:02d}',
+    '%y/%m/%d %H:%M:%S': '{y:02d}/{m:02d}/{d:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%Y-%m-%d': '{Y:04d}-{m:02d}-{d:02d}',
+    '%Y-%m-%d %H:%M:%S': '{Y:04d}-{m:02d}-{d:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%Y/%m/%d': '{Y:04d}/{m:02d}/{d:02d}',
+    '%Y/%m/%d %H:%M:%S': '{Y:04d}/{m:02d}/{d:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%y-%d-%m': '{y:02d}-{d:02d}-{m:02d}',
+    '%y-%d-%m %H:%M:%S': '{y:02d}-{d:02d}-{m:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%y/%d/%m': '{y:02d}/{d:02d}/{m:02d}',
+    '%y/%d/%m %H:%M:%S': '{y:02d}/{d:02d}/{m:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%Y-%d-%m': '{Y:04d}-{d:02d}-{m:02d}',
+    '%Y-%d-%m %H:%M:%S': '{Y:04d}-{d:02d}-{m:02d} {H:02d}:{M:02d}:{S:02d}',
+    '%Y/%d/%m': '{Y:04d}/{d:02d}/{m:02d}',
+    '%Y/%d/%m %H:%M:%S': '{Y:04d}/{d:02d}/{m:02d} {H:02d}:{M:02d}:{S:02d}'
+}
 
 
 def generate_string(length):
@@ -72,7 +111,11 @@ parameters_builders_registry = {
     'bag': assign_vocab,
     'sequence': assign_vocab,
     'timeseries': return_none,
-    'image': return_none
+    'image': return_none,
+    'audio': return_none,
+    'date': return_none,
+    'h3': return_none,
+    VECTOR: return_none
 }
 
 
@@ -90,7 +133,7 @@ def build_synthetic_dataset(dataset_size, features):
 def generate_datapoint(features):
     datapoint = []
     for feature in features:
-        if ('cycle' in feature and feature['cycle'] == True and
+        if ('cycle' in feature and feature['cycle'] is True and
                 feature['type'] in cyclers_registry):
             cycler_function = cyclers_registry[feature['type']]
             feature_value = cycler_function(feature)
@@ -167,6 +210,28 @@ def generate_timeseries(feature):
     return ' '.join(series)
 
 
+def generate_audio(feature):
+    audio_length = feature['preprocessing']['audio_file_length_limit_in_s']
+    audio_dest_folder = feature['audio_dest_folder']
+    sampling_rate = 16000
+    num_samples = int(audio_length * sampling_rate)
+    audio = np.sin(np.arange(num_samples)/100 * 2 * np.pi) * 2 * (np.random.random(num_samples) - 0.5)
+    audio_filename = uuid.uuid4().hex[:10].upper() + '.wav'
+
+    try:
+        if not os.path.exists(audio_dest_folder):
+            os.mkdir(audio_dest_folder)
+
+        audio_dest_path = os.path.join(audio_dest_folder, audio_filename)
+        sf.write(audio_dest_path, audio, sampling_rate)
+
+    except IOError as e:
+        raise IOError('Unable to create a folder for audio or save audio to disk.'
+                      '{0}'.format(e))
+
+    return audio_dest_path
+
+
 def generate_image(feature):
     # Read num_channels, width, height
     num_channels = feature['preprocessing']['num_channels']
@@ -201,6 +266,54 @@ def generate_image(feature):
     return image_dest_path
 
 
+def generate_datetime(feature):
+    """picking a format among different types.
+    If no format is specified, the first one is used.
+    """
+    if 'datetime_format' in feature:
+        datetime_generation_format = DATETIME_FORMATS[
+            feature['datetime_format']
+        ]
+    elif ('preprocessing' in feature and
+          'datetime_format' in feature['preprocessing']):
+        datetime_generation_format = DATETIME_FORMATS[
+            feature['preprocessing']['datetime_format']
+        ]
+    else:
+        datetime_generation_format = DATETIME_FORMATS[0]
+
+    y = random.randint(1, 99)
+    Y = random.randint(1, 9999)
+    m = random.randint(1, 12)
+    d = random.randint(1, 28)
+    H = random.randint(1, 12)
+    M = random.randint(1, 59)
+    S = random.randint(1, 59)
+
+    return datetime_generation_format.format(y=y, Y=Y, m=m, d=d, H=H, M=M, S=S)
+
+
+def generate_h3(feature):
+    resolution = random.randint(0, 15)  # valid values [0, 15]
+    h3_components = {
+        'mode': 1,  # we can avoid testing other modes
+        'edge': 0,  # only used in other modes
+        'resolution': resolution,
+        'base_cell': random.randint(0, 121),  # valid values [0, 121]
+        # valid values [0, 7]
+        'cells': [random.randint(0, 7) for _ in range(resolution)]
+    }
+
+    return components_to_h3(h3_components)
+
+
+def generate_vector(feature):
+    # Space delimited string with floating point numbers
+    return ' '.join(
+        [str(100 * random.random()) for _ in range(feature['vector_size'])]
+    )
+
+
 generators_registry = {
     'category': generate_category,
     'text': generate_sequence,
@@ -210,7 +323,12 @@ generators_registry = {
     'bag': generate_bag,
     'sequence': generate_sequence,
     'timeseries': generate_timeseries,
-    'image': generate_image
+    'image': generate_image,
+    'audio': generate_audio,
+    'h3': generate_h3,
+    'date': generate_datetime,
+    VECTOR: generate_vector
+
 }
 
 category_cycle = 0
@@ -275,7 +393,7 @@ if __name__ == '__main__':
           {name: timeseries_1, type: timeseries, max_len: 20}, \
           {name: timeseries_2, type: timeseries, max_len: 20}, \
           ]',
-        type=yaml.load, help='dataset features'
+        type=yaml.safe_load, help='dataset features'
     )
     args = parser.parse_args()
 

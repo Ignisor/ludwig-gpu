@@ -25,6 +25,7 @@ import sys
 
 import numpy as np
 
+from ludwig.contrib import contrib_command
 from ludwig.data.preprocessing import preprocess_for_prediction
 from ludwig.globals import LUDWIG_VERSION
 from ludwig.globals import TRAIN_SET_METADATA_FILE_NAME
@@ -35,12 +36,14 @@ from ludwig.utils.print_utils import print_ludwig
 from ludwig.utils.strings_utils import make_safe_filename
 
 
+logger = logging.getLogger(__name__)
+
+
 def collect_activations(
         model_path,
         tensors,
         data_csv=None,
         data_hdf5=None,
-        dataset_type='generic',
         split='test',
         batch_size=128,
         output_directory='results',
@@ -58,7 +61,6 @@ def collect_activations(
            the tensors are collected
     :param data_hdf5: The HDF5 file path if the CSV file path does not exist,
            an alternative source of providing the data to the model
-    :param dataset_type: Dataset type
     :param split: Split type
     :param batch_size: Batch size
     :param output_directory: Output directory
@@ -76,13 +78,12 @@ def collect_activations(
         experiment_dir_name = output_directory + '_' + str(suffix)
         suffix += 1
 
-    logging.info('Dataset type: {}'.format(dataset_type))
-    logging.info('Dataset path: {}'.format(
+    logger.info('Dataset path: {}'.format(
         data_csv if data_csv is not None else data_hdf5)
     )
-    logging.info('Model path: {}'.format(model_path))
-    logging.info('Output path: {}'.format(experiment_dir_name))
-    logging.info('\n')
+    logger.info('Model path: {}'.format(model_path))
+    logger.info('Output path: {}'.format(experiment_dir_name))
+    logger.info('\n')
 
     train_set_metadata_fp = os.path.join(
         model_path,
@@ -93,7 +94,6 @@ def collect_activations(
     dataset, train_set_metadata = preprocess_for_prediction(
         model_path,
         split,
-        dataset_type,
         data_csv,
         data_hdf5,
         train_set_metadata_fp
@@ -117,7 +117,7 @@ def collect_activations(
     os.mkdir(experiment_dir_name)
     save_tensors(collected_tensors, experiment_dir_name)
 
-    logging.info('Saved to: {0}'.format(experiment_dir_name))
+    logger.info('Saved to: {0}'.format(experiment_dir_name))
 
 
 def collect_weights(
@@ -134,9 +134,9 @@ def collect_weights(
         experiment_dir_name = output_directory + '_' + str(suffix)
         suffix += 1
 
-    logging.info('Model path: {}'.format(model_path))
-    logging.info('Output path: {}'.format(experiment_dir_name))
-    logging.info('\n')
+    logger.info('Model path: {}'.format(model_path))
+    logger.info('Output path: {}'.format(experiment_dir_name))
+    logger.info('\n')
 
     model, model_definition = load_model_and_definition(model_path)
 
@@ -149,7 +149,7 @@ def collect_weights(
     os.mkdir(experiment_dir_name)
     save_tensors(collected_tensors, experiment_dir_name)
 
-    logging.info('Saved to: {0}'.format(experiment_dir_name))
+    logger.info('Saved to: {0}'.format(experiment_dir_name))
 
 
 def save_tensors(collected_tensors, experiment_dir_name):
@@ -276,10 +276,8 @@ def cli_collect_activations(sys_argv):
 
     args = parser.parse_args(sys_argv)
 
-    logging.basicConfig(
-        stream=sys.stdout,
-        level=logging_level_registry[args.logging_level],
-        format='%(message)s'
+    logging.getLogger('ludwig').setLevel(
+        logging_level_registry[args.logging_level]
     )
 
     print_ludwig('Collect Activations', LUDWIG_VERSION)
@@ -351,12 +349,9 @@ def cli_collect_weights(sys_argv):
 
     args = parser.parse_args(sys_argv)
 
-    logging.basicConfig(
-        stream=sys.stdout,
-        level=logging_level_registry[args.logging_level],
-        format='%(message)s'
+    logging.getLogger('ludwig').setLevel(
+        logging_level_registry[args.logging_level]
     )
-
     print_ludwig('Collect Weights', LUDWIG_VERSION)
     collect_weights(**vars(args))
 
@@ -364,8 +359,10 @@ def cli_collect_weights(sys_argv):
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         if sys.argv[1] == 'activations':
+            contrib_command("collect_activations", *sys.argv)
             cli_collect_activations(sys.argv[2:])
         elif sys.argv[1] == 'weights':
+            contrib_command("collect_weights", *sys.argv)
             cli_collect_weights(sys.argv[2:])
         else:
             print('Unrecognized command')

@@ -16,16 +16,23 @@
 import tensorflow as tf
 
 
-def optimize(loss, training_parameters, learning_rate, global_step,
-             horovod=None):
-    if training_parameters is not None and training_parameters['decay'] == True:
-        learning_rate = tf.train.exponential_decay(
+def optimize(
+        loss,
+        training_parameters,
+        learning_rate,
+        global_step,
+        horovod=None
+):
+    if training_parameters is not None and training_parameters['decay'] is True:
+        learning_rate = tf.compat.v1.train.exponential_decay(
             learning_rate, global_step,
             training_parameters['decay_steps'],
             training_parameters['decay_rate'],
             staircase=training_parameters['staircase'])
 
-    with tf.variable_scope('optimizer'):
+    update_ops = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.UPDATE_OPS)
+
+    with tf.compat.v1.variable_scope('optimizer'):
         if training_parameters is not None:
             optimizer_args = dict(training_parameters['optimizer'])
             optimizer_type = optimizer_args.pop('type')
@@ -59,6 +66,8 @@ def optimize(loss, training_parameters, learning_rate, global_step,
             optimize = optimizer.minimize(loss,
                                           global_step=global_step)
 
+    optimize = tf.group([optimize, update_ops])
+
     return optimize, learning_rate
 
 
@@ -72,7 +81,7 @@ def get_optimizer_fun(optimizer_type):
     ):
         return tf.train.GradientDescentOptimizer
     elif optimizer_type == 'adam':
-        return tf.train.AdamOptimizer
+        return tf.compat.v1.train.AdamOptimizer
     elif optimizer_type == 'adadelta':
         return tf.train.AdadeltaOptimizer
     elif optimizer_type == 'adagrad':

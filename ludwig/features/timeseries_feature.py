@@ -31,7 +31,12 @@ from ludwig.models.modules.measure_modules import r2
 from ludwig.models.modules.measure_modules import squared_error
 from ludwig.utils.misc import get_from_registry
 from ludwig.utils.misc import set_default_value
-from ludwig.utils.strings_utils import format_registry
+from ludwig.utils.strings_utils import tokenizer_registry
+
+logger = logging.getLogger(__name__)
+
+
+logger = logging.getLogger(__name__)
 
 
 class TimeseriesBaseFeature(BaseFeature):
@@ -43,20 +48,20 @@ class TimeseriesBaseFeature(BaseFeature):
         'timeseries_length_limit': 256,
         'padding_value': 0,
         'padding': 'right',
-        'format': 'space',
+        'tokenizer': 'space',
         'missing_value_strategy': FILL_WITH_CONST,
         'fill_value': ''
     }
 
     @staticmethod
     def get_feature_meta(column, preprocessing_parameters):
-        format_function = get_from_registry(
-            preprocessing_parameters['format'],
-            format_registry
-        )
+        tokenizer = get_from_registry(
+            preprocessing_parameters['tokenizer'],
+            tokenizer_registry
+        )()
         max_length = 0
         for timeseries in column:
-            processed_line = format_function(timeseries)
+            processed_line = tokenizer(timeseries)
             max_length = max(max_length, len(processed_line))
         max_length = min(
             preprocessing_parameters['timeseries_length_limit'],
@@ -68,27 +73,27 @@ class TimeseriesBaseFeature(BaseFeature):
     @staticmethod
     def build_matrix(
             timeseries,
-            format_str,
+            tokenizer_name,
             length_limit,
             padding_value,
             padding='right'
     ):
-        format_function = get_from_registry(
-            format_str,
-            format_registry
-        )
+        tokenizer = get_from_registry(
+            tokenizer_name,
+            tokenizer_registry
+        )()
         max_length = 0
         ts_vectors = []
         for ts in timeseries:
-            ts_vector = np.array(format_function(ts)).astype(np.float32)
+            ts_vector = np.array(tokenizer(ts)).astype(np.float32)
             ts_vectors.append(ts_vector)
             if len(ts_vector) > max_length:
                 max_length = len(ts_vector)
 
         if max_length < length_limit:
-            logging.debug(
+            logger.debug(
                 'max length of {0}: {1} < limit: {2}'.format(
-                    format_str,
+                    tokenizer_name,
                     max_length,
                     length_limit
                 )
@@ -111,7 +116,7 @@ class TimeseriesBaseFeature(BaseFeature):
     def feature_data(column, metadata, preprocessing_parameters):
         timeseries_data = TimeseriesBaseFeature.build_matrix(
             column,
-            preprocessing_parameters['format'],
+            preprocessing_parameters['tokenizer'],
             metadata['max_timeseries_length'],
             preprocessing_parameters['padding_value'],
             preprocessing_parameters['padding'])
@@ -153,7 +158,7 @@ class TimeseriesInputFeature(TimeseriesBaseFeature, SequenceInputFeature):
             **kwargs
     ):
         placeholder = self._get_input_placeholder()
-        logging.debug('  placeholder: {0}'.format(placeholder))
+        logger.debug('  placeholder: {0}'.format(placeholder))
 
         return self.build_sequence_input(
             placeholder,
@@ -246,6 +251,8 @@ class TimeseriesOutputFeature(TimeseriesBaseFeature, SequenceOutputFeature):
             hidden,
             hidden_size,
             regularizer=None,
+            dropout_rate=None,
+            is_training=None,
             **kwargs
     ):
         output_tensors = {}
@@ -253,7 +260,7 @@ class TimeseriesOutputFeature(TimeseriesBaseFeature, SequenceOutputFeature):
         # ================ Placeholder ================
         targets = self._get_output_placeholder()
         output_tensors[self.name] = targets
-        logging.debug('  targets_placeholder: {0}'.format(targets))
+        logger.debug('  targets_placeholder: {0}'.format(targets))
 
         # ================ Predictions ================
         (
@@ -382,7 +389,7 @@ class TimeseriesOutputFeature(TimeseriesBaseFeature, SequenceOutputFeature):
             result,
             metadata,
             experiment_dir_name,
-            skip_save_unprocessed_output=False
+            skip_save_unprocessed_output=False,
     ):
         pass
 

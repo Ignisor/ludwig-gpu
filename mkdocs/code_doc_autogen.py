@@ -27,9 +27,23 @@ import os
 import re
 import sys
 
+from ludwig.visualize import learning_curves, compare_performance, \
+    compare_classifiers_performance_from_prob, \
+    compare_classifiers_performance_from_pred, \
+    compare_classifiers_performance_subset, \
+    compare_classifiers_performance_changing_k, \
+    compare_classifiers_multiclass_multimetric, compare_classifiers_predictions, \
+    confidence_thresholding_2thresholds_2d, \
+    confidence_thresholding_2thresholds_3d, confidence_thresholding, \
+    confidence_thresholding_data_vs_acc, \
+    confidence_thresholding_data_vs_acc_subset, binary_threshold_vs_metric, \
+    roc_curves, roc_curves_from_test_statistics, calibration_1_vs_all, \
+    calibration_multiclass, confusion_matrix, frequency_vs_f1
+
 sys.path.append("../")
 
 import ludwig
+from ludwig.api import LudwigModel
 
 EXCLUDE = {}
 
@@ -71,11 +85,36 @@ EXCLUDE = {}
 
 PAGES = [
     {
-        'page': 'api.md',
+        'page': 'api/LudwigModel.md',
         'classes': [
-            (ludwig.api.LudwigModel, "*")
-        ]
+            (LudwigModel, "*")
+        ],
     },
+    {
+        'page': 'api/visualization.md',
+        'functions': [
+            learning_curves,
+            compare_performance,
+            compare_classifiers_performance_from_prob,
+            compare_classifiers_performance_from_pred,
+            compare_classifiers_performance_subset,
+            compare_classifiers_performance_changing_k,
+            compare_classifiers_multiclass_multimetric,
+            compare_classifiers_predictions,
+            confidence_thresholding_2thresholds_2d,
+            confidence_thresholding_2thresholds_3d,
+            confidence_thresholding,
+            confidence_thresholding_data_vs_acc,
+            confidence_thresholding_data_vs_acc_subset,
+            binary_threshold_vs_metric,
+            roc_curves,
+            roc_curves_from_test_statistics,
+            calibration_1_vs_all,
+            calibration_multiclass,
+            confusion_matrix,
+            frequency_vs_f1,
+        ]
+    }
     # {
     #     'page': 'api/sequential_encoders.md',
     #     'classes': [
@@ -148,8 +187,8 @@ def post_process_signature(signature):
 
 
 def clean_module_name(name):
-    if name.startswith('ludwig.api'):
-        name = name.replace('ludwig.api', 'ludwig')
+    # if name.startswith('ludwig.api'):
+    #    name = name.replace('ludwig.api', 'ludwig')
     return name
 
 
@@ -247,7 +286,7 @@ def process_list_block(docstring, starting_point, section_end,
             line = line[8:]
             inside_brackets = ''
             pos_open_bracket = line.find('(')
-            pos_close_bracket = line.find(')')
+            pos_close_bracket = line.rfind(')')
             if pos_open_bracket and pos_close_bracket:
                 inside_brackets = ' ({})'.format(
                     line[pos_open_bracket + 1:pos_close_bracket])

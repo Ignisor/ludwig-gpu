@@ -34,6 +34,7 @@ from ludwig.globals import LUDWIG_VERSION, set_on_master, is_on_master
 from ludwig.globals import TRAIN_SET_METADATA_FILE_NAME
 from ludwig.models.model import Model
 from ludwig.models.model import load_model_and_definition
+from ludwig.models.modules.measure_modules import get_best_function
 from ludwig.utils.data_utils import save_json
 from ludwig.utils.defaults import default_random_seed
 from ludwig.utils.defaults import merge_with_defaults
@@ -43,10 +44,16 @@ from ludwig.utils.print_utils import logging_level_registry
 from ludwig.utils.print_utils import print_boxed
 from ludwig.utils.print_utils import print_ludwig
 
+logger = logging.getLogger(__name__)
+
 
 def full_train(
         model_definition,
         model_definition_file=None,
+        data_df=None,
+        data_train_df=None,
+        data_validation_df=None,
+        data_test_df=None,
         data_csv=None,
         data_train_csv=None,
         data_validation_csv=None,
@@ -65,6 +72,7 @@ def full_train(
         skip_save_log=False,
         skip_save_processed_input=False,
         output_directory='results',
+        should_close_session=True,
         gpus=None,
         gpu_fraction=1.0,
         use_horovod=False,
@@ -75,6 +83,10 @@ def full_train(
     """*full_train* defines the entire training procedure used by Ludwig's
     internals. Requires most of the parameters that are taken into the model.
     Builds a full ludwig model and performs the training.
+    :param data_test_df:
+    :param data_df:
+    :param data_train_df:
+    :param data_validation_df:
     :param model_definition: Model definition which defines the different
            parameters of the model, features, preprocessing and training.
     :type model_definition: Dictionary
@@ -166,7 +178,7 @@ def full_train(
     # set input features defaults
     if model_definition_file is not None:
         with open(model_definition_file, 'r') as def_file:
-            model_definition = merge_with_defaults(yaml.load(def_file))
+            model_definition = merge_with_defaults(yaml.safe_load(def_file))
     else:
         model_definition = merge_with_defaults(model_definition)
 
@@ -177,7 +189,7 @@ def full_train(
             experiment_dir_name = model_resume_path
         else:
             if is_on_master():
-                logging.info(
+                logger.info(
                     'Model resume path does not exists, '
                     'starting training from scratch'
                 )
@@ -192,6 +204,13 @@ def full_train(
             )
         else:
             experiment_dir_name = '/'
+
+    # if model_load_path is not None, load its train_set_metadata
+    if model_load_path is not None:
+        train_set_metadata_json = os.path.join(
+            model_load_path,
+            TRAIN_SET_METADATA_FILE_NAME
+        )
 
     description_fn, training_stats_fn, model_dir = get_file_names(
         experiment_dir_name
@@ -214,22 +233,21 @@ def full_train(
     if is_on_master():
         save_json(description_fn, description)
         # print description
-        logging.info('Experiment name: {}'.format(experiment_name))
-        logging.info('Model name: {}'.format(model_name))
-        logging.info('Output path: {}'.format(experiment_dir_name))
-        logging.info('\n')
+        logger.info('Experiment name: {}'.format(experiment_name))
+        logger.info('Model name: {}'.format(model_name))
+        logger.info('Output path: {}'.format(experiment_dir_name))
+        logger.info('\n')
         for key, value in description.items():
-            logging.info('{}: {}'.format(key, pformat(value, indent=4)))
-        logging.info('\n')
+            logger.info('{}: {}'.format(key, pformat(value, indent=4)))
+        logger.info('\n')
 
     # preprocess
-    (
-        training_set,
-        validation_set,
-        test_set,
-        train_set_metadata
-    ) = preprocess_for_training(
+    preprocessed_data = preprocess_for_training(
         model_definition,
+        data_df=data_df,
+        data_train_df=data_train_df,
+        data_validation_df=data_validation_df,
+        data_test_df=data_test_df,
         data_csv=data_csv,
         data_train_csv=data_train_csv,
         data_validation_csv=data_validation_csv,
@@ -243,12 +261,18 @@ def full_train(
         preprocessing_params=model_definition['preprocessing'],
         random_seed=random_seed
     )
+
+    (training_set,
+     validation_set,
+     test_set,
+     train_set_metadata) = preprocessed_data
+
     if is_on_master():
-        logging.info('Training set: {0}'.format(training_set.size))
+        logger.info('Training set: {0}'.format(training_set.size))
         if validation_set is not None:
-            logging.info('Validation set: {0}'.format(validation_set.size))
+            logger.info('Validation set: {0}'.format(validation_set.size))
         if test_set is not None:
-            logging.info('Test set: {0}'.format(test_set.size))
+            logger.info('Test set: {0}'.format(test_set.size))
 
     # update model definition with metadata properties
     update_model_definition_with_metadata(
@@ -288,49 +312,61 @@ def full_train(
     )
 
     train_trainset_stats, train_valisest_stats, train_testset_stats = result
-    model.close_session()
+    train_stats = {
+        'train': train_trainset_stats,
+        'validation': train_valisest_stats,
+        'test': train_testset_stats
+    }
+
+    if should_close_session:
+        model.close_session()
 
     if is_on_master():
         # save training and test statistics
-        save_json(
-            training_stats_fn,
-            {
-                'train': train_trainset_stats,
-                'validation': train_valisest_stats,
-                'test': train_testset_stats
-            }
-        )
+        save_json(training_stats_fn, train_stats)
 
     # grab the results of the model with highest validation test performance
     validation_field = model_definition['training']['validation_field']
     validation_measure = model_definition['training']['validation_measure']
     validation_field_result = train_valisest_stats[validation_field]
-    if validation_set is not None:
-        epoch_max_vali_measure, max_vali_measure = max(
+
+    best_function = get_best_function(validation_measure)
+    # results of the model with highest validation test performance
+    if is_on_master() and validation_set is not None:
+        epoch_best_vali_measure, best_vali_measure = best_function(
             enumerate(validation_field_result[validation_measure]),
             key=lambda pair: pair[1]
         )
-        max_vali_measure_epoch_test_measure = train_testset_stats[validation_field][
-            validation_measure][epoch_max_vali_measure]
-
-    # results of the model with highest validation test performance
-    if is_on_master():
-        if validation_set is not None:
-            logging.info(
-                'Best validation model epoch:'.format(epoch_max_vali_measure + 1)
-            )
-            logging.info(
-                'Best validation model {0} on validation set {1}: {2}'.format(
-                    validation_measure, validation_field, max_vali_measure
-                ))
-            logging.info('Best validation model {0} on test set {1}: {2}'.format(
-                validation_measure, validation_field,
-                max_vali_measure_epoch_test_measure
+        logger.info(
+            'Best validation model epoch: {0}'.format(
+                epoch_best_vali_measure + 1)
+        )
+        logger.info(
+            'Best validation model {0} on validation set {1}: {2}'.format(
+                validation_measure, validation_field, best_vali_measure
             ))
-        logging.info('\nFinished: {0}_{1}'.format(experiment_name, model_name))
-        logging.info('Saved to: {0}'.format(experiment_dir_name))
+        if test_set is not None:
+            best_vali_measure_epoch_test_measure = train_testset_stats[
+                validation_field][validation_measure][epoch_best_vali_measure]
+
+            logger.info(
+                'Best validation model {0} on test set {1}: {2}'.format(
+                    validation_measure,
+                    validation_field,
+                    best_vali_measure_epoch_test_measure
+                )
+            )
+        logger.info('\nFinished: {0}_{1}'.format(experiment_name, model_name))
+        logger.info('Saved to: {0}'.format(experiment_dir_name))
 
     contrib_command("train_save", experiment_dir_name)
+
+    return (model,
+            preprocessed_data,
+            experiment_dir_name,
+            train_stats,
+            model_definition
+            )
 
 
 def train(
@@ -402,12 +438,12 @@ def train(
         # Load model
         if is_on_master():
             print_boxed('LOADING MODEL')
-            logging.info('Loading model: {}\n'.format(model_load_path))
+            logger.info('Loading model: {}\n'.format(model_load_path))
         model, _ = load_model_and_definition(model_load_path)
     else:
         # Build model
         if is_on_master():
-            print_boxed('BUILDING MODEL', print_fun=logging.debug)
+            print_boxed('BUILDING MODEL', print_fun=logger.debug)
 
         model = Model(
             model_definition['input_features'],
@@ -627,7 +663,7 @@ def cli(sys_argv):
     model_definition.add_argument(
         '-md',
         '--model_definition',
-        type=yaml.load,
+        type=yaml.safe_load,
         help='model definition'
     )
     model_definition.add_argument(
@@ -728,12 +764,9 @@ def cli(sys_argv):
 
     args = parser.parse_args(sys_argv)
 
-    logging.basicConfig(
-        stream=sys.stdout,
-        level=logging_level_registry[args.logging_level],
-        format='%(message)s'
+    logging.getLogger('ludwig').setLevel(
+        logging_level_registry[args.logging_level]
     )
-
     set_on_master(args.use_horovod)
 
     if is_on_master():
@@ -743,4 +776,5 @@ def cli(sys_argv):
 
 
 if __name__ == '__main__':
+    contrib_command("train", *sys.argv)
     cli(sys.argv[1:])

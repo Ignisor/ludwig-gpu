@@ -20,6 +20,9 @@ import tensorflow as tf
 from ludwig.models.modules.initializer_modules import get_initializer
 
 
+logger = logging.getLogger(__name__)
+
+
 def fc_layer(inputs, in_count, out_count,
              activation='relu', norm=None,
              is_training=True, weights=None, biases=None,
@@ -40,19 +43,19 @@ def fc_layer(inputs, in_count, out_count,
                 initializer = get_initializer('glorot_uniform')
             # if initializer is None, tensorFlow seems to be using
             # a glorot uniform initializer
-            weights = tf.get_variable(
+            weights = tf.compat.v1.get_variable(
                 'weights',
                 [in_count, out_count],
                 regularizer=regularizer,
                 initializer=initializer
             )
 
-    logging.debug('  fc_weights: {}'.format(weights))
+    logger.debug('  fc_weights: {}'.format(weights))
 
     if biases is None:
-        biases = tf.get_variable('biases', [out_count],
+        biases = tf.compat.v1.get_variable('biases', [out_count],
                                  initializer=tf.constant_initializer(0.01))
-    logging.debug('  fc_biases: {}'.format(biases))
+    logger.debug('  fc_biases: {}'.format(biases))
 
     hidden = tf.matmul(inputs, weights) + biases
 
@@ -69,7 +72,7 @@ def fc_layer(inputs, in_count, out_count,
     if dropout and dropout_rate is not None:
         hidden = tf.layers.dropout(hidden, rate=dropout_rate,
                                    training=is_training)
-        logging.debug('  fc_dropout: {}'.format(hidden))
+        logger.debug('  fc_dropout: {}'.format(hidden))
 
     return hidden
 
@@ -118,7 +121,7 @@ class FCStack:
     ):
         hidden = inputs
         for i, layer in enumerate(self.layers):
-            with tf.variable_scope('fc_' + str(i)):
+            with tf.compat.v1.variable_scope('fc_' + str(i)):
                 hidden = fc_layer(
                     hidden,
                     inputs_size,
@@ -132,7 +135,7 @@ class FCStack:
                     regularizer=regularizer if layer[
                         'regularize'] else None
                 )
-                logging.debug('  fc_{}: {}'.format(i, hidden))
+                logger.debug('  fc_{}: {}'.format(i, hidden))
 
             inputs_size = layer['fc_size']
 

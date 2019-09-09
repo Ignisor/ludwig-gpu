@@ -25,6 +25,7 @@ import sys
 from collections import OrderedDict
 from pprint import pformat
 
+from ludwig.contrib import contrib_command
 from ludwig.data.postprocessing import postprocess
 from ludwig.data.preprocessing import preprocess_for_prediction
 from ludwig.features.feature_registries import output_type_registry
@@ -39,16 +40,18 @@ from ludwig.utils.print_utils import print_boxed
 from ludwig.utils.print_utils import print_ludwig
 
 
+logger = logging.getLogger(__name__)
+
+
 def full_predict(
         model_path,
         data_csv=None,
         data_hdf5=None,
-        dataset_type='generic',
         split='test',
         batch_size=128,
         skip_save_unprocessed_output=False,
         output_directory='results',
-        only_predictions=False,
+        evaluate_performance=True,
         gpus=None,
         gpu_fraction=1.0,
         use_horovod=False,
@@ -63,12 +66,11 @@ def full_predict(
         suffix += 1
 
     if is_on_master():
-        logging.info('Dataset type: {}'.format(dataset_type))
-        logging.info('Dataset path: {}'.format(
+        logger.info('Dataset path: {}'.format(
             data_csv if data_csv is not None else data_hdf5))
-        logging.info('Model path: {}'.format(model_path))
-        logging.info('Output path: {}'.format(experiment_dir_name))
-        logging.info('')
+        logger.info('Model path: {}'.format(model_path))
+        logger.info('Output path: {}'.format(experiment_dir_name))
+        logger.info('')
 
     train_set_metadata_json_fp = os.path.join(
         model_path,
@@ -79,11 +81,10 @@ def full_predict(
     dataset, train_set_metadata = preprocess_for_prediction(
         model_path,
         split,
-        dataset_type,
         data_csv,
         data_hdf5,
         train_set_metadata_json_fp,
-        only_predictions
+        evaluate_performance
     )
 
     # run the prediction
@@ -98,7 +99,7 @@ def full_predict(
         model,
         model_definition,
         batch_size,
-        only_predictions,
+        evaluate_performance,
         gpus,
         gpu_fraction,
         debug
@@ -119,11 +120,11 @@ def full_predict(
 
         save_prediction_outputs(postprocessed_output, experiment_dir_name)
 
-        if not only_predictions:
-            print_prediction_results(prediction_results)
-            save_prediction_statistics(prediction_results, experiment_dir_name)
+        if evaluate_performance:
+            print_test_results(prediction_results)
+            save_test_statistics(prediction_results, experiment_dir_name)
 
-        logging.info('Saved to: {0}'.format(experiment_dir_name))
+        logger.info('Saved to: {0}'.format(experiment_dir_name))
 
 
 def predict(
@@ -132,13 +133,13 @@ def predict(
         model,
         model_definition,
         batch_size=128,
-        only_predictions=False,
+        evaluate_performance=True,
         gpus=None,
         gpu_fraction=1.0,
         debug=False
 ):
     """Computes predictions based on the computed model.
-        :param dataset: Dataset contaning the data to calculate
+        :param dataset: Dataset containing the data to calculate
                the predictions from.
         :type dataset: Dataset
         :param model: The trained model used to produce the predictions.
@@ -148,32 +149,32 @@ def predict(
         :type model_definition: Dictionary
         :param batch_size: The size of batches when computing the predictions.
         :type batch_size: Integer
-        :param only_predictions: If this parameter is True, only the predictions
-               will be returned, if it is False, also performance metrics
+        :param evaluate_performance: If this parameter is False, only the predictions
+               will be returned, if it is True, also performance metrics
                will be calculated on the predictions. It requires the data
-               to contanin also ground truth for the output features, otherwise
+               to contain also ground truth for the output features, otherwise
                the metrics cannot be computed.
-        :type only_predictions: Bool
+        :type evaluate_performance: Bool
         :type gpus: List
         :type gpu_fraction: Integer
         :param debug: If true turns on tfdbg with inf_or_nan checks.
         :type debug: Boolean
 
-        :returns: A dictionary contaning the predictions of each output feature,
+        :returns: A dictionary containing the predictions of each output feature,
                   alongside with statistics on the quality of those predictions
-                  (if only_predictions is False).
+                  (if evaluate_performance is True).
         """
     if is_on_master():
         print_boxed('PREDICT')
     test_stats = model.predict(
         dataset,
         batch_size,
-        only_predictions=only_predictions,
+        evaluate_performance=evaluate_performance,
         gpus=gpus,
         gpu_fraction=gpu_fraction
     )
 
-    if not only_predictions:
+    if evaluate_performance:
         calculate_overall_stats(
             test_stats,
             model_definition['output_features'],
@@ -210,19 +211,19 @@ def save_prediction_outputs(
                 save_csv(csv_filename.format(output_field, output_type), values)
 
 
-def save_prediction_statistics(prediction_stats, experiment_dir_name):
+def save_test_statistics(test_stats, experiment_dir_name):
     test_stats_fn = os.path.join(
         experiment_dir_name,
-        'prediction_statistics.json'
+        'test_statistics.json'
     )
-    save_json(test_stats_fn, prediction_stats)
+    save_json(test_stats_fn, test_stats)
 
 
-def print_prediction_results(prediction_stats):
-    for output_field, result in prediction_stats.items():
+def print_test_results(test_stats):
+    for output_field, result in test_stats.items():
         if (output_field != 'combined' or
-                (output_field == 'combined' and len(prediction_stats) > 2)):
-            logging.info('\n===== {} ====='.format(output_field))
+                (output_field == 'combined' and len(test_stats) > 2)):
+            logger.info('\n===== {} ====='.format(output_field))
             for measure in sorted(list(result)):
                 if measure != 'confusion_matrix' and measure != 'roc_curve':
                     value = result[measure]
@@ -230,7 +231,7 @@ def print_prediction_results(prediction_stats):
                         value_repr = repr_ordered_dict(value)
                     else:
                         value_repr = pformat(result[measure], indent=2)
-                    logging.info(
+                    logger.info(
                         '{0}: {1}'.format(
                             measure,
                             value_repr
@@ -316,13 +317,6 @@ def cli(sys_argv):
         default=128,
         help='size of batches'
     )
-    parser.add_argument(
-        '-op',
-        '--only_predictions',
-        action='store_true',
-        default=False,
-        help='skip metrics calculation'
-    )
 
     # ------------------
     # Runtime parameters
@@ -364,13 +358,11 @@ def cli(sys_argv):
     )
 
     args = parser.parse_args(sys_argv)
+    args.evaluate_performance = False
 
-    logging.basicConfig(
-        stream=sys.stdout,
-        level=logging_level_registry[args.logging_level],
-        format='%(message)s'
+    logging.getLogger('ludwig').setLevel(
+        logging_level_registry[args.logging_level]
     )
-
     set_on_master(args.use_horovod)
 
     if is_on_master():
@@ -380,4 +372,5 @@ def cli(sys_argv):
 
 
 if __name__ == '__main__':
+    contrib_command("predict", *sys.argv)
     cli(sys.argv[1:])

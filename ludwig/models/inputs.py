@@ -23,6 +23,9 @@ from ludwig.utils.algorithms_utils import topological_sort_feature_dependencies
 from ludwig.utils.misc import get_from_registry
 
 
+logger = logging.getLogger(__name__)
+
+
 def build_inputs(input_features,
                  regularizer,
                  dropout_rate,
@@ -47,14 +50,14 @@ def build_single_input(input_feature,
                        is_training=True,
                        **kwargs):
     scope_name = input_feature['name']
-    logging.debug('- Input {} feature {}'.format(
+    logger.debug('- Input {} feature {}'.format(
         input_feature['type'],
         input_feature['name']
     ))
     if input_feature.get('tied_weights', None) is not None:
         scope_name = input_feature['tied_weights']
 
-    with tf.variable_scope(scope_name, reuse=tf.AUTO_REUSE):
+    with tf.compat.v1.variable_scope(scope_name, reuse=tf.compat.v1.AUTO_REUSE):
         input_feature_class = get_from_registry(
             input_feature['type'],
             input_type_registry

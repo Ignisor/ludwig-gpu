@@ -27,17 +27,19 @@ import os
 import re
 import signal
 import sys
-import time
 import threading
+import time
 from collections import OrderedDict
 
 import numpy as np
 import tensorflow as tf
 from tabulate import tabulate
 from tensorflow.python import debug as tf_debug
+from tensorflow.python.saved_model import builder as saved_model_builder
 from tqdm import tqdm
 
 from ludwig.constants import *
+from ludwig.contrib import contrib_command
 from ludwig.features.feature_registries import output_type_registry
 from ludwig.features.feature_utils import SEQUENCE_TYPES
 from ludwig.globals import MODEL_HYPERPARAMETERS_FILE_NAME
@@ -58,14 +60,15 @@ from ludwig.utils.batcher import Batcher
 from ludwig.utils.batcher import BucketedBatcher
 from ludwig.utils.batcher import DistributedBatcher
 from ludwig.utils.data_utils import load_json, save_json
-from ludwig.utils.data_utils import load_object
-from ludwig.utils.data_utils import save_object
 from ludwig.utils.defaults import default_random_seed
 from ludwig.utils.defaults import default_training_params
-from ludwig.utils.math_utils import learning_rate_warmup
+from ludwig.utils.math_utils import learning_rate_warmup_distributed, \
+    learning_rate_warmup
 from ludwig.utils.misc import set_random_seed
 from ludwig.utils.misc import sum_dicts
 from ludwig.utils.tf_utils import get_tf_config
+
+logger = logging.getLogger(__name__)
 
 
 class Model:
@@ -131,26 +134,26 @@ class Model:
         if self.horovod:
             self.horovod.init()
 
-        tf.reset_default_graph()
+        tf.compat.v1.reset_default_graph()
         graph = tf.Graph()
         with graph.as_default():
             # ================ Setup ================
-            tf.set_random_seed(random_seed)
+            tf.compat.v1.set_random_seed(random_seed)
 
             self.global_step = tf.Variable(0, trainable=False)
-            self.regularization_lambda = tf.placeholder(
+            self.regularization_lambda = tf.compat.v1.placeholder(
                 tf.float32,
                 name='regularization_lambda'
             )
             regularizer = regularizer_registry[training['regularizer']]
             self.regularizer = regularizer(self.regularization_lambda)
 
-            self.learning_rate = tf.placeholder(
+            self.learning_rate = tf.compat.v1.placeholder(
                 tf.float32,
                 name='learning_rate'
             )
-            self.dropout_rate = tf.placeholder(tf.float32, name='dropout_rate')
-            self.is_training = tf.placeholder(tf.bool, [], name='is_training')
+            self.dropout_rate = tf.compat.v1.placeholder(tf.float32, name='dropout_rate')
+            self.is_training = tf.compat.v1.placeholder(tf.bool, [], name='is_training')
 
             # ================ Inputs ================
             feature_encodings = build_inputs(
@@ -164,7 +167,7 @@ class Model:
                 setattr(self, fe_name, fe_properties['placeholder'])
 
             # ================ Model ================
-            logging.debug('- Combiner {}'.format(combiner['type']))
+            logger.debug('- Combiner {}'.format(combiner['type']))
             build_combiner = get_build_combiner(combiner['type'])(**combiner)
             hidden, hidden_size = build_combiner(
                 feature_encodings,
@@ -203,19 +206,19 @@ class Model:
                 self.horovod
             )
 
-            tf.summary.scalar('train_reg_mean_loss', self.train_reg_mean_loss)
+            tf.compat.v1.summary.scalar('train_reg_mean_loss', self.train_reg_mean_loss)
 
-            self.merged_summary = tf.summary.merge_all()
+            self.merged_summary = tf.compat.v1.summary.merge_all()
             self.graph = graph
-            self.graph_initialize = tf.global_variables_initializer()
+            self.graph_initialize = tf.compat.v1.global_variables_initializer()
             if self.horovod:
                 self.broadcast_op = self.horovod.broadcast_global_variables(0)
-            self.saver = tf.train.Saver()
+            self.saver = tf.compat.v1.train.Saver()
 
     def initialize_session(self, gpus=None, gpu_fraction=1):
         if self.session is None:
 
-            self.session = tf.Session(
+            self.session = tf.compat.v1.Session(
                 config=get_tf_config(gpus, gpu_fraction, self.horovod),
                 graph=self.graph
             )
@@ -284,7 +287,7 @@ class Model:
             increase_batch_size_on_plateau_patience=5,
             increase_batch_size_on_plateau_rate=2,
             increase_batch_size_on_plateau_max=512,
-            learning_rate_warmup_epochs=5,  # used when training with Horovod
+            learning_rate_warmup_epochs=1,
             resume=False,
             skip_save_model=False,
             skip_save_progress=False,
@@ -410,10 +413,13 @@ class Model:
         # ====== Setup session =======
         session = self.initialize_session(gpus, gpu_fraction)
 
+        if self.weights_save_path:
+            self.restore(session, self.weights_save_path)
+
         train_writer = None
         if is_on_master():
             if not skip_save_log:
-                train_writer = tf.summary.FileWriter(
+                train_writer = tf.compat.v1.summary.FileWriter(
                     os.path.join(save_path, 'log', 'train'),
                     session.graph
                 )
@@ -477,7 +483,7 @@ class Model:
             # epoch init
             start_time = time.time()
             if is_on_master():
-                logging.info(
+                logger.info(
                     '\nEpoch {epoch:{digits}d}'.format(
                         epoch=progress_tracker.epoch + 1,
                         digits=digits_per_epochs
@@ -488,7 +494,7 @@ class Model:
 
             # ================ Train ================
             if is_on_master():
-                bar = tqdm(
+                progress_bar = tqdm(
                     desc='Training',
                     total=batcher.steps_per_epoch,
                     file=sys.stdout,
@@ -500,7 +506,7 @@ class Model:
                 batch = batcher.next_batch()
 
                 if self.horovod:
-                    current_learning_rate = learning_rate_warmup(
+                    current_learning_rate = learning_rate_warmup_distributed(
                         progress_tracker.learning_rate,
                         progress_tracker.epoch,
                         learning_rate_warmup_epochs,
@@ -509,7 +515,13 @@ class Model:
                         batcher.steps_per_epoch
                     ) * self.horovod.size()
                 else:
-                    current_learning_rate = progress_tracker.learning_rate
+                    current_learning_rate = learning_rate_warmup(
+                        progress_tracker.learning_rate,
+                        progress_tracker.epoch,
+                        learning_rate_warmup_epochs,
+                        batcher.step,
+                        batcher.steps_per_epoch
+                    )
 
                 readout_nodes = {'optimize': self.optimize}
                 if not skip_save_log:
@@ -534,11 +546,11 @@ class Model:
 
                 progress_tracker.steps += 1
                 if is_on_master():
-                    bar.update(1)
+                    progress_bar.update(1)
 
             # post training
             if is_on_master():
-                bar.close()
+                progress_bar.close()
 
             progress_tracker.epoch += 1
             batcher.reset()  # todo this may be useless, doublecheck
@@ -594,7 +606,7 @@ class Model:
             elapsed_time = (time.time() - start_time) * 1000.0
 
             if is_on_master():
-                logging.info('Took {time}'.format(
+                logger.info('Took {time}'.format(
                     time=time_utils.strdelta(elapsed_time)))
 
             # stat prints
@@ -605,7 +617,7 @@ class Model:
                          len(output_features) > 1)
                 ):
                     if is_on_master():
-                        logging.info(
+                        logger.info(
                             tabulate(
                                 table,
                                 headers='firstrow',
@@ -648,12 +660,11 @@ class Model:
             if is_on_master():
                 if not skip_save_progress:
                     self.save_weights(session, model_weights_progress_path)
-                    save_object(
+                    progress_tracker.save(
                         os.path.join(
                             save_path,
                             TRAINING_PROGRESS_FILE_NAME
-                        ),
-                        progress_tracker
+                        )
                     )
                     if skip_save_model:
                         self.save_hyperparameters(
@@ -662,7 +673,8 @@ class Model:
                         )
 
             if is_on_master():
-                logging.info('')
+                contrib_command("train_epoch_end", progress_tracker)
+                logger.info('')
 
         if train_writer is not None:
             train_writer.close()
@@ -688,7 +700,7 @@ class Model:
         batcher = self.initialize_batcher(dataset, batch_size, bucketing_field)
 
         # training step loop
-        bar = tqdm(
+        progress_bar = tqdm(
             desc='Trainining online',
             total=batcher.steps_per_epoch,
             file=sys.stdout,
@@ -708,9 +720,9 @@ class Model:
                     is_training=True
                 )
             )
-            bar.update(1)
+            progress_bar.update(1)
 
-        bar.close()
+        progress_bar.close()
 
     def evaluation(
             self,
@@ -775,7 +787,7 @@ class Model:
         set_size = dataset.size
         if set_size == 0:
             if is_on_master():
-                logging.warning('No datapoints to evaluate on.')
+                logger.warning('No datapoints to evaluate on.')
             return output_stats
         seq_set_size = {output_feature['name']: {} for output_feature in
                         self.hyperparameters['output_features'] if
@@ -789,7 +801,7 @@ class Model:
         )
 
         if is_on_master():
-            bar = tqdm(
+            progress_bar = tqdm(
                 desc='Evaluation' if name is None
                 else 'Evaluation {0: <5.5}'.format(name),
                 total=batcher.steps_per_epoch,
@@ -817,10 +829,10 @@ class Model:
                 result
             )
             if is_on_master():
-                bar.update(1)
+                progress_bar.update(1)
 
         if is_on_master():
-            bar.close()
+            progress_bar.close()
 
         if self.horovod:
             output_stats, seq_set_size = self.merge_workers_outputs(
@@ -878,7 +890,7 @@ class Model:
             should_shuffle=False
         )
 
-        bar = tqdm(
+        progress_bar = tqdm(
             desc='Collecting Tensors',
             total=batcher.steps_per_epoch,
             file=sys.stdout,
@@ -899,9 +911,9 @@ class Model:
                 for row in result[tensor_name]:
                     collected_tensors[tensor_name].append(row)
 
-            bar.update(1)
+            progress_bar.update(1)
 
-        bar.close()
+        progress_bar.close()
 
         return collected_tensors
 
@@ -1150,7 +1162,7 @@ class Model:
                         self.hyperparameters,
                         model_hyperparameters_path
                     )
-                    logging.info(
+                    logger.info(
                         'Validation {} on {} improved, model saved'.format(
                             validation_measure,
                             validation_field
@@ -1162,7 +1174,7 @@ class Model:
         )
         if progress_tracker.last_improvement != 0:
             if is_on_master():
-                logging.info(
+                logger.info(
                     'Last improvement of {} on {} happened '
                     '{} epoch{} ago'.format(
                         validation_measure,
@@ -1195,7 +1207,7 @@ class Model:
         if early_stop > 0:
             if progress_tracker.last_improvement >= early_stop:
                 if is_on_master():
-                    logging.info(
+                    logger.info(
                         "\nEARLY STOPPING due to lack of validation improvement"
                         ", it has been {0} epochs since last validation "
                         "accuracy improvement\n".format(
@@ -1210,7 +1222,7 @@ class Model:
             self,
             dataset,
             batch_size,
-            only_predictions=False,
+            evaluate_performance=True,
             gpus=None,
             gpu_fraction=1,
             **kwargs
@@ -1231,7 +1243,7 @@ class Model:
             batch_size,
             is_training=False,
             collect_predictions=True,
-            only_predictions=only_predictions
+            only_predictions=not evaluate_performance
         )
 
         return predict_stats
@@ -1324,6 +1336,36 @@ class Model:
                 feature['pretrained_embeddings'] = None
         save_json(save_path, hyperparameters, sort_keys=True, indent=4)
 
+    def save_savedmodel(self, save_path):
+
+        input_tensors = {}
+        for input_feature in self.hyperparameters['input_features']:
+            input_tensors[input_feature['name']] = getattr(
+                self, input_feature['name']
+            )
+
+        output_tensors = {}
+        for output_feature in self.hyperparameters['output_features']:
+            output_tensors[output_feature['name']] = getattr(
+                self,
+                output_feature['name']
+            )
+
+        session = self.initialize_session()
+
+        builder = saved_model_builder.SavedModelBuilder(save_path)
+        builder.add_meta_graph_and_variables(
+            session,
+            [tf.saved_model.tag_constants.SERVING],
+            signature_def_map={
+                'predict': tf.saved_model.predict_signature_def(
+                    input_tensors, output_tensors)
+            },
+            strip_default_attrs=True,
+            saver=self.saver,
+        )
+        builder.save()
+
     def restore(self, session, weights_path):
         self.saver.restore(session, weights_path)
 
@@ -1345,26 +1387,26 @@ class Model:
         if not self.received_sigint:
             self.epochs = 1
             self.received_sigint = True
-            logging.critical(
+            logger.critical(
                 '\nReceived SIGINT, will finish this epoch and then conclude '
                 'the training'
             )
-            logging.critical(
+            logger.critical(
                 'Send another SIGINT to immediately interrupt the process'
             )
         else:
-            logging.critical('\nReceived a second SIGINT, will now quit')
+            logger.critical('\nReceived a second SIGINT, will now quit')
             sys.exit(1)
 
     def quit_training(self, signum, frame):
-        logging.critical('Received SIGQUIT, will kill training')
+        logger.critical('Received SIGQUIT, will kill training')
         sys.exit(1)
 
     def resume_training(self, save_path, model_weights_path):
         if is_on_master():
-            logging.info('Resuming training of model: {0}'.format(save_path))
+            logger.info('Resuming training of model: {0}'.format(save_path))
         self.weights_save_path = model_weights_path
-        progress_tracker = load_object(
+        progress_tracker = ProgressTracker.load(
             os.path.join(
                 save_path,
                 TRAINING_PROGRESS_FILE_NAME
@@ -1502,7 +1544,7 @@ class Model:
             if (progress_tracker.num_reductions_lr >=
                     reduce_learning_rate_on_plateau):
                 if is_on_master():
-                    logging.info(
+                    logger.info(
                         'It has been ' +
                         str(progress_tracker.last_improvement) +
                         ' epochs since last validation accuracy improvement '
@@ -1512,7 +1554,7 @@ class Model:
                     )
             else:
                 if is_on_master():
-                    logging.info(
+                    logger.info(
                         'PLATEAU REACHED, reducing learning rate '
                         'due to lack of validation improvement, it has been ' +
                         str(progress_tracker.last_improvement) +
@@ -1542,7 +1584,7 @@ class Model:
             if (progress_tracker.num_increases_bs >=
                     increase_batch_size_on_plateau):
                 if is_on_master():
-                    logging.info(
+                    logger.info(
                         'It has been ' +
                         str(progress_tracker.last_improvement) +
                         ' epochs since last validation accuracy improvement '
@@ -1554,7 +1596,7 @@ class Model:
             elif (progress_tracker.batch_size ==
                   increase_batch_size_on_plateau_max):
                 if is_on_master():
-                    logging.info(
+                    logger.info(
                         'It has been' +
                         str(progress_tracker.last_improvement) +
                         ' epochs since last validation accuracy improvement '
@@ -1566,7 +1608,7 @@ class Model:
                     )
             else:
                 if is_on_master():
-                    logging.info(
+                    logger.info(
                         'PLATEAU REACHED '
                         'increasing batch size due to lack of '
                         'validation improvement, it has been ' +
@@ -1598,13 +1640,14 @@ class ProgressTracker:
             num_increases_bs,
             train_stats,
             vali_stats,
-            test_stats
+            test_stats,
+            last_improvement=0
     ):
         self.batch_size = batch_size
         self.epoch = epoch
         self.steps = steps
         self.last_improvement_epoch = last_improvement_epoch
-        self.last_improvement = 0
+        self.last_improvement = last_improvement
         self.learning_rate = learning_rate
         self.best_valid_measure = best_valid_measure
         self.num_reductions_lr = num_reductions_lr
@@ -1612,6 +1655,14 @@ class ProgressTracker:
         self.train_stats = train_stats
         self.vali_stats = vali_stats
         self.test_stats = test_stats
+
+    def save(self, filepath):
+        save_json(filepath, self.__dict__)
+
+    @staticmethod
+    def load(filepath):
+        loaded = load_json(filepath)
+        return ProgressTracker(**loaded)
 
 
 def load_model_and_definition(model_dir, use_horovod=False):

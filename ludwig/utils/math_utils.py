@@ -19,30 +19,6 @@ import math
 import numpy as np
 
 
-def jaccard(sorted_list_1, sorted_list_2):
-    max_jaccard_score = 0
-    for path1 in sorted_list_1:
-        for path2 in sorted_list_2:
-            size_set_1 = len(path1)
-            size_set_2 = len(path2)
-
-            intersection = 0
-            for i in range(min(size_set_1, size_set_2)):
-                last_p1 = path1[-(i + 1)]
-                last_p2 = path2[-(i + 1)]
-                if last_p1 == last_p2:
-                    intersection += 1
-                else:
-                    break
-
-            jaccard_score = intersection / (
-                    size_set_1 + size_set_2 - intersection)
-            if jaccard_score > max_jaccard_score:
-                max_jaccard_score = jaccard_score
-
-    return max_jaccard_score
-
-
 def softmax(x, temperature=1.0):
     e_x = np.exp((x - np.max(x)) / temperature)
     return e_x / e_x.sum()
@@ -69,8 +45,14 @@ def convert_size(size_bytes):
     return '{} {}'.format(s, size_name[i])
 
 
-def learning_rate_warmup(learning_rate, epoch, warmup_epochs, num_workers,
-                         curr_step, steps_per_epoch):
+def learning_rate_warmup_distributed(
+        learning_rate,
+        epoch,
+        warmup_epochs,
+        num_workers,
+        curr_step,
+        steps_per_epoch
+):
     """Implements gradual learning rate warmup:
     `lr = initial_lr / hvd.size()` ---> `lr = initial_lr`
      `initial_lr` is the learning rate of the model optimizer at the start
@@ -98,3 +80,25 @@ def learning_rate_warmup(learning_rate, epoch, warmup_epochs, num_workers,
         epoch_adjusted = float(epoch) + (curr_step / steps_per_epoch)
         return learning_rate / num_workers * \
                (epoch_adjusted * (num_workers - 1) / warmup_epochs + 1)
+
+
+def learning_rate_warmup(
+        learning_rate,
+        epoch,
+        warmup_epochs,
+        curr_step,
+        steps_per_epoch
+):
+    global_curr_step = 1 + curr_step + epoch * steps_per_epoch
+    warmup_steps = warmup_epochs * steps_per_epoch
+
+    warmup_percent_done = global_curr_step / warmup_steps
+    warmup_learning_rate = learning_rate * warmup_percent_done
+
+    is_warmup = int(global_curr_step < warmup_steps)
+    interpolated_learning_rate = (
+            (1.0 - is_warmup) * learning_rate +
+            is_warmup * warmup_learning_rate
+    )
+
+    return interpolated_learning_rate
